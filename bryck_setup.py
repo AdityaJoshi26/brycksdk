@@ -1045,6 +1045,12 @@ class InstallPackagesAndSDKs(SetupTask):
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
+        # Step 0: Ensure package index is fresh and fix any broken state
+        self.logger.info("  Running apt update...")
+        self.ssh.run_command("apt-get update", use_sudo=True)
+        self.logger.info("  Fixing any broken packages...")
+        self.ssh.run_command("DEBIAN_FRONTEND=noninteractive apt --fix-broken install -y", use_sudo=True)
+
         # Step 1: Install apt packages (batch 1)
         pkgs = " ".join(self.APT_PACKAGES_BATCH1)
         self.logger.info(f"  Installing packages (batch 1): {pkgs}")
@@ -1063,9 +1069,9 @@ class InstallPackagesAndSDKs(SetupTask):
             f"DEBIAN_FRONTEND=noninteractive apt install -y {pkgs}", use_sudo=True
         )
         if exit_code != 0:
-            self.logger.error(f"  Batch 2 install failed: {err}")
-            return False
-        self.logger.info("  Batch 2 installed.")
+            self.logger.warning(f"  Batch 2 install had issues (non-fatal): {err}")
+        else:
+            self.logger.info("  Batch 2 installed.")
 
         # Step 3: Install pip packages
         for pkg in self.PIP_PACKAGES:
@@ -1423,16 +1429,27 @@ class DeployBryckBuild(SetupTask):
             tarball = f"{build_name}.tar.gz"
         deploy_dir = f"/home/bryck/{build_name}"
 
-        # Step 1: Check if already deployed
+        # Step 1: If already installed, uninstall first (enforce clean install)
         self.logger.info("  Checking if Bryck is already installed...")
         exit_code, _, _ = self.ssh.run_command("test -d /opt/bryck")
         if exit_code == 0:
-            exit_code, _, _ = self.ssh.run_command("test -f /etc/bryck/bryckutil/config.json")
-            if exit_code == 0:
-                self.logger.info("  Bryck already installed (/opt/bryck and config.json exist). Skipping.")
-                # Still apply post-deploy config
-                self._post_deploy_config(inventory_type)
-                return True
+            self.logger.info("  Bryck is already installed. Running bryckdeploy uninstall first...")
+            # Find the existing deploy directory to run uninstall from
+            exit_code, existing_dir, _ = self.ssh.run_command(
+                "ls -d /home/bryck/tsecond-bryck-* 2>/dev/null | head -1"
+            )
+            uninstall_dir = existing_dir.strip() if exit_code == 0 and existing_dir.strip() else deploy_dir
+            exit_code, out, err = self.ssh.run_command(
+                f'su - bryck -c "cd {uninstall_dir} && python3 bryckdeploy uninstall -v"',
+                use_sudo=True,
+                timeout=300,
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  bryckdeploy uninstall returned non-zero: {err}")
+                self.logger.info("  Attempting manual cleanup of /opt/bryck...")
+                self.ssh.run_command("rm -rf /opt/bryck", use_sudo=True)
+            else:
+                self.logger.info("  bryckdeploy uninstall completed.")
 
         # Step 2: Download/transfer build tarball
         self.logger.info(f"  Downloading {tarball}...")
@@ -1518,17 +1535,61 @@ class DeployBryckBuild(SetupTask):
                 return False
             self.ssh.run_command(f"chown -R bryck:bryck {deploy_dir}", use_sudo=True)
 
-        # Step 6: Run bryckdeploy install
-        self.logger.info("  Running bryckdeploy install -v (this may take several minutes)...")
-        exit_code, out, err = self.ssh.run_command(
-            f'su - bryck -c "cd {deploy_dir} && python3 bryckdeploy install -v"',
-            use_sudo=True,
-            timeout=600,
-        )
-        if exit_code != 0:
-            self.logger.error(f"  bryckdeploy install failed: {err}")
-            self.logger.debug(f"  Output: {out}")
+        # Step 6: Run bryckdeploy install (in background) and monitor ansible.log
+        self.logger.info("  Running bryckdeploy install -v (this may take 15-30+ minutes)...")
+        self.logger.info("  Monitoring /opt/ansible/ansible.log for completion...")
+
+        # Record the current ansible.log line count so we only monitor new output
+        self.ssh.run_command("mkdir -p /opt/ansible", use_sudo=True)
+        self.ssh.run_command("touch /opt/ansible/ansible.log", use_sudo=True)
+        self.ssh.run_command("chmod 666 /opt/ansible/ansible.log", use_sudo=True)
+        exit_code, wc_out, _ = self.ssh.run_command("wc -l < /opt/ansible/ansible.log 2>/dev/null")
+        ansible_log_start_line = int(wc_out.strip()) if wc_out.strip().isdigit() else 0
+        self.logger.info(f"  ansible.log baseline: {ansible_log_start_line} lines (monitoring from here)")
+
+        # Launch bryckdeploy in background using a launcher script (avoids
+        # shell quoting / transport issues with nohup+su+sudo via paramiko)
+        deploy_log = f"/home/bryck/bryckdeploy_output.log"
+        launcher_script = f"/home/bryck/run_bryckdeploy.sh"
+        try:
+            sftp = self.ssh.client.open_sftp()
+            with sftp.file(launcher_script, "w") as f:
+                f.write("#!/bin/bash\n")
+                f.write(f"cd {deploy_dir}\n")
+                f.write(f"python3 bryckdeploy install -v > {deploy_log} 2>&1\n")
+            sftp.close()
+        except Exception as e:
+            self.logger.error(f"  Failed to write launcher script: {e}")
             return False
+
+        self.ssh.run_command(f"chmod +x {launcher_script}", use_sudo=True)
+        self.ssh.run_command(f"chown bryck:bryck {launcher_script}", use_sudo=True)
+
+        # Run the script as bryck user in background (nohup + disown)
+        self.ssh.run_command(
+            f"bash -c 'nohup su - bryck -c {launcher_script} </dev/null >/dev/null 2>&1 & disown'",
+            use_sudo=True,
+            timeout=10,
+        )
+
+        # Give the process a moment to start
+        time.sleep(5)
+
+        # Verify it launched
+        exit_code, proc_out, _ = self.ssh.run_command("pgrep -f 'bryckdeploy install'")
+        if exit_code != 0:
+            self.logger.error("  bryckdeploy process did not start. Check launcher script.")
+            exit_code, script_err, _ = self.ssh.run_command(f"cat {deploy_log} 2>/dev/null")
+            self.logger.error(f"  Deploy log: {script_err}")
+            return False
+        self.logger.info(f"  bryckdeploy started (PID: {proc_out.strip()})")
+
+        # Poll /opt/ansible/ansible.log until we see completion or failure
+        success = self._wait_for_ansible_completion(deploy_dir, deploy_log, ansible_log_start_line)
+
+        if not success:
+            return False
+
         self.logger.info("  bryckdeploy install completed.")
 
         # Step 7: Post-deploy configuration
@@ -1536,6 +1597,102 @@ class DeployBryckBuild(SetupTask):
 
         self.logger.info("  Bryck build deployed successfully.")
         return True
+
+    def _wait_for_ansible_completion(self, deploy_dir: str, deploy_log: str, log_start_line: int) -> bool:
+        """
+        Monitor /opt/ansible/ansible.log and the bryckdeploy process to detect
+        when the installation finishes (success or failure).
+
+        Only reads lines added AFTER log_start_line to ignore previous runs.
+
+        Checks:
+        - ansible.log for 'failed=1' or 'unreachable=1' -> failure
+        - ansible.log for PLAY RECAP with 'failed=0' -> success
+        - bryckdeploy process no longer running -> check exit status from log
+        """
+        ANSIBLE_LOG = "/opt/ansible/ansible.log"
+        POLL_INTERVAL = 30   # seconds between checks
+        MAX_WAIT = 2400      # 40 minutes max
+        # tail command to only read lines from this run (skip previous content)
+        tail_new_cmd = f"tail -n +{log_start_line + 1} {ANSIBLE_LOG} 2>/dev/null"
+
+        elapsed = 0
+        last_log_lines = 0
+
+        while elapsed < MAX_WAIT:
+            time.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+
+            # Check if the bryckdeploy process is still running
+            exit_code, proc_out, _ = self.ssh.run_command(
+                "pgrep -f 'bryckdeploy install' > /dev/null 2>&1 && echo RUNNING || echo DONE"
+            )
+            process_running = "RUNNING" in proc_out
+
+            # Read the tail of NEW ansible.log content to check for completion markers
+            exit_code, log_tail, _ = self.ssh.run_command(
+                f"{tail_new_cmd} | tail -50"
+            )
+
+            # Log progress (show new line count from this run)
+            exit_code, wc_out, _ = self.ssh.run_command(f"wc -l < {ANSIBLE_LOG} 2>/dev/null")
+            total_lines = int(wc_out.strip()) if wc_out.strip().isdigit() else 0
+            current_lines = total_lines - log_start_line
+            if current_lines > last_log_lines:
+                self.logger.info(f"  [{elapsed}s] ansible.log: {current_lines} new lines (process {'running' if process_running else 'finished'})")
+                last_log_lines = current_lines
+
+            # Check for PLAY RECAP which indicates ansible finished
+            if "PLAY RECAP" in log_tail:
+                # Look for failure indicators in the RECAP
+                if "failed=0" in log_tail and "unreachable=0" in log_tail:
+                    self.logger.info("  Ansible PLAY RECAP: all tasks succeeded (failed=0, unreachable=0).")
+                    return True
+                elif "failed=" in log_tail:
+                    # Extract the recap line for logging
+                    for line in log_tail.splitlines():
+                        if "failed=" in line:
+                            self.logger.error(f"  Ansible PLAY RECAP indicates failure: {line.strip()}")
+                    return False
+
+            # If process is done but no PLAY RECAP yet, check deploy log for exit
+            if not process_running:
+                self.logger.info("  bryckdeploy process has exited. Checking results...")
+                # Give a moment for log flush
+                time.sleep(5)
+
+                # Re-read ansible log for final state (only new content from this run)
+                exit_code, final_log, _ = self.ssh.run_command(f"{tail_new_cmd} | tail -100")
+
+                if "PLAY RECAP" in final_log:
+                    if "failed=0" in final_log and "unreachable=0" in final_log:
+                        self.logger.info("  Ansible PLAY RECAP: all tasks succeeded.")
+                        return True
+                    else:
+                        for line in final_log.splitlines():
+                            if "failed=" in line:
+                                self.logger.error(f"  Ansible PLAY RECAP: {line.strip()}")
+                        return False
+
+                # No PLAY RECAP found — check deploy output log
+                exit_code, deploy_out, _ = self.ssh.run_command(f"tail -20 {deploy_log} 2>/dev/null")
+                self.logger.info(f"  bryckdeploy output (last 20 lines):\n{deploy_out}")
+
+                # If /opt/bryck exists after deploy, consider it successful
+                exit_code, _, _ = self.ssh.run_command("test -d /opt/bryck")
+                if exit_code == 0:
+                    self.logger.info("  /opt/bryck exists — treating as successful install.")
+                    return True
+
+                self.logger.error("  bryckdeploy exited without clear success signal.")
+                return False
+
+        # Timeout reached
+        self.logger.error(f"  bryckdeploy did not complete within {MAX_WAIT}s.")
+        # Show last ansible log lines for debugging (only from this run)
+        exit_code, log_tail, _ = self.ssh.run_command(f"{tail_new_cmd} | tail -30")
+        self.logger.error(f"  Last ansible.log lines:\n{log_tail}")
+        return False
 
     def _post_deploy_config(self, inventory_type: str) -> None:
         """Apply post-deployment configuration."""
