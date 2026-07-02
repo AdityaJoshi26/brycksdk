@@ -1397,8 +1397,11 @@ class DeployBryckBuild(SetupTask):
 
     REPO_BASE_URL = "http://repos.tsecond.ai/ubuntu"
 
-    # Build server for bryckmini (BlueField DPU builds)
-    BUILD_SERVER_IP = "192.168.6.193"
+    # Build servers
+    # bryckmini (BlueField DPU / arm64 builds)
+    BUILD_SERVER_MINI_IP = "192.168.6.193"
+    # bryckserver (amd64 builds)
+    BUILD_SERVER_AMD64_IP = "192.168.6.28"
     BUILD_SERVER_USER = "bryck"
     BUILD_SERVER_PASSWORD = "while(1);"
 
@@ -1413,9 +1416,11 @@ class DeployBryckBuild(SetupTask):
         # Strip .tar.gz if user included it in the build name
         if build_name.endswith(".tar.gz"):
             build_name = build_name[: -len(".tar.gz")]
-        # Strip -arm64 suffix if user included it
+        # Strip architecture suffix if user included it
         if build_name.endswith("-arm64"):
             build_name = build_name[: -len("-arm64")]
+        if build_name.endswith("-amd64"):
+            build_name = build_name[: -len("-amd64")]
 
         # Determine bryck_type value for inventory
         # bryckmini -> "mini", bryckserver -> "bryck"
@@ -1424,11 +1429,11 @@ class DeployBryckBuild(SetupTask):
         else:
             inventory_type = "bryck"
 
-        # For bryckmini (arm64), the tarball has an -arm64 suffix
+        # Architecture suffix: bryckmini -> arm64, bryckserver -> amd64
         if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
             tarball = f"{build_name}-arm64.tar.gz"
         else:
-            tarball = f"{build_name}.tar.gz"
+            tarball = f"{build_name}-amd64.tar.gz"
         deploy_dir = f"/home/bryck/{build_name}"
 
         # Step 1: If already installed, uninstall first (enforce clean install)
@@ -1459,33 +1464,25 @@ class DeployBryckBuild(SetupTask):
         if exit_code == 0:
             self.logger.info(f"  Tarball already exists at /home/bryck/{tarball}. Skipping download.")
         else:
+            # Determine which build server to SCP from
             if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
-                # For bryckmini: SCP from build server (192.168.6.193)
-                self.logger.info(
-                    f"  SCP from {self.BUILD_SERVER_USER}@{self.BUILD_SERVER_IP}:/home/bryck/builds/{tarball}..."
-                )
-                scp_cmd = (
-                    f"sshpass -p '{self.BUILD_SERVER_PASSWORD}' "
-                    f"scp -o StrictHostKeyChecking=no "
-                    f"{self.BUILD_SERVER_USER}@{self.BUILD_SERVER_IP}:/home/bryck/builds/{tarball} "
-                    f"/home/bryck/{tarball}"
-                )
-                exit_code, _, err = self.ssh.run_command(scp_cmd, use_sudo=True, timeout=300)
-                if exit_code != 0:
-                    self.logger.error(f"  SCP from build server failed: {err}")
-                    return False
+                build_server_ip = self.BUILD_SERVER_MINI_IP
             else:
-                # For bryckserver: download from repo
-                download_url = f"{self.REPO_BASE_URL}/{tarball}"
-                self.logger.info(f"  Downloading from {download_url}...")
-                exit_code, _, err = self.ssh.run_command(
-                    f"wget -q -O /home/bryck/{tarball} {download_url}",
-                    use_sudo=True,
-                    timeout=300,
-                )
-                if exit_code != 0:
-                    self.logger.error(f"  Failed to download build: {err}")
-                    return False
+                build_server_ip = self.BUILD_SERVER_AMD64_IP
+
+            self.logger.info(
+                f"  SCP from {self.BUILD_SERVER_USER}@{build_server_ip}:/home/bryck/builds/{tarball}..."
+            )
+            scp_cmd = (
+                f"sshpass -p '{self.BUILD_SERVER_PASSWORD}' "
+                f"scp -o StrictHostKeyChecking=no "
+                f"{self.BUILD_SERVER_USER}@{build_server_ip}:/home/bryck/builds/{tarball} "
+                f"/home/bryck/{tarball}"
+            )
+            exit_code, _, err = self.ssh.run_command(scp_cmd, use_sudo=True, timeout=300)
+            if exit_code != 0:
+                self.logger.error(f"  SCP from build server failed: {err}")
+                return False
             # Set ownership
             self.ssh.run_command(f"chown bryck:bryck /home/bryck/{tarball}", use_sudo=True)
 
