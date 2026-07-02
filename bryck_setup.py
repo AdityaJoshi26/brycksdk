@@ -1323,8 +1323,9 @@ class ConfigureNetworkManagerAndSSL(SetupTask):
 
         # --- Part 3: SSH key setup for bryck user ---
         self.logger.info("  Setting up SSH keys for bryck user...")
+        # Must check with sudo since the file is owned by bryck with mode 600
         exit_code, _, _ = self.ssh.run_command(
-            "test -f /home/bryck/.ssh/id_rsa"
+            "test -f /home/bryck/.ssh/id_rsa", use_sudo=True
         )
         if exit_code == 0:
             self.logger.info("  SSH key already exists for bryck. Skipping keygen.")
@@ -1335,10 +1336,11 @@ class ConfigureNetworkManagerAndSSL(SetupTask):
                 use_sudo=True,
             )
 
-            # Generate SSH key as bryck user
+            # Generate SSH key as bryck user (use -y to overwrite without prompting)
             self.logger.info("  Generating RSA key for bryck...")
             exit_code, _, err = self.ssh.run_command(
-                'su - bryck -c "ssh-keygen -t rsa -N \\\"\\\" -f /home/bryck/.ssh/id_rsa"',
+                'bash -c "rm -f /home/bryck/.ssh/id_rsa /home/bryck/.ssh/id_rsa.pub && '
+                'su - bryck -c \\"ssh-keygen -t rsa -N \\\\\\"\\\\\\"\\ -f /home/bryck/.ssh/id_rsa\\""',
                 use_sudo=True,
             )
             if exit_code != 0:
@@ -1535,6 +1537,17 @@ class DeployBryckBuild(SetupTask):
                 return False
             self.ssh.run_command(f"chown -R bryck:bryck {deploy_dir}", use_sudo=True)
 
+        # Step 5b: Fix known package version conflicts before deploy
+        # The ansible playbook pins jq=1.6-2.1ubuntu3 but libjq1 may have been
+        # updated to 1.6-2.1ubuntu3.1, causing a dependency mismatch.
+        # We must downgrade to the EXACT versions the playbook expects.
+        self.logger.info("  Fixing potential package version conflicts (jq/libjq1)...")
+        self.ssh.run_command(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "
+            "libjq1=1.6-2.1ubuntu3 jq=1.6-2.1ubuntu3 2>/dev/null || true",
+            use_sudo=True,
+        )
+
         # Step 6: Run bryckdeploy install (in background) and monitor ansible.log
         self.logger.info("  Running bryckdeploy install -v (this may take 15-30+ minutes)...")
         self.logger.info("  Monitoring /opt/ansible/ansible.log for completion...")
@@ -1553,7 +1566,7 @@ class DeployBryckBuild(SetupTask):
         launcher_script = f"/home/bryck/run_bryckdeploy.sh"
         try:
             sftp = self.ssh.client.open_sftp()
-            with sftp.file(launcher_script, "w") as f:
+            with sftp.file("/tmp/run_bryckdeploy.sh", "w") as f:
                 f.write("#!/bin/bash\n")
                 f.write(f"cd {deploy_dir}\n")
                 f.write(f"python3 bryckdeploy install -v > {deploy_log} 2>&1\n")
@@ -1562,6 +1575,7 @@ class DeployBryckBuild(SetupTask):
             self.logger.error(f"  Failed to write launcher script: {e}")
             return False
 
+        self.ssh.run_command(f"mv /tmp/run_bryckdeploy.sh {launcher_script}", use_sudo=True)
         self.ssh.run_command(f"chmod +x {launcher_script}", use_sudo=True)
         self.ssh.run_command(f"chown bryck:bryck {launcher_script}", use_sudo=True)
 
