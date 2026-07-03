@@ -1040,7 +1040,7 @@ class InstallPackagesAndSDKs(SetupTask):
         "rclone", "curl", "jq", "sysbench",
     ]
 
-    PIP_PACKAGES = ["ansible", "pyroute2"]
+    PIP_PACKAGES = ["ansible", "pyroute2", "boto3", "netifaces"]
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
@@ -1258,7 +1258,7 @@ class ConfigureNetworkManagerAndSSL(SetupTask):
     name = "Configure NetworkManager, SSL & SSH Keys"
 
     NM_CONF_FILE = "/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf"
-    NM_CONF_CONTENT = "unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma,except:type:ethernet\n"
+    NM_CONF_CONTENT = "[keyfile]\nunmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma,except:type:ethernet\n"
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
@@ -1267,9 +1267,10 @@ class ConfigureNetworkManagerAndSSL(SetupTask):
         self.logger.info("  Configuring NetworkManager managed devices...")
         exit_code, current, _ = self.ssh.run_command(f"cat {self.NM_CONF_FILE}", use_sudo=True)
 
-        if "except:type:ethernet" in current:
-            self.logger.info("  NetworkManager already configured for ethernet. Skipping.")
+        if "[keyfile]" in current and "except:type:ethernet" in current:
+            self.logger.info("  NetworkManager already configured correctly. Skipping.")
         else:
+            self.logger.info("  Writing correct NM config (fixing potential corruption)...")
             # Write config via SFTP (avoids quoting issues)
             try:
                 sftp = self.ssh.client.open_sftp()
@@ -1440,7 +1441,10 @@ class DeployBryckBuild(SetupTask):
         self.logger.info("  Checking if Bryck is already installed...")
         exit_code, _, _ = self.ssh.run_command("test -d /opt/bryck")
         if exit_code == 0:
-            self.logger.info("  Bryck is already installed. Running bryckdeploy uninstall first...")
+            self.logger.info("  Bryck is already installed. Stopping services and running clean uninstall...")
+            # Stop all bryck services before uninstall for clean teardown
+            self.ssh.run_command("systemctl stop 'bryck*' 2>/dev/null || true", use_sudo=True)
+            self.ssh.run_command("systemctl stop bryckweb bryckutil bryckmonitor 2>/dev/null || true", use_sudo=True)
             # Find the existing deploy directory to run uninstall from
             exit_code, existing_dir, _ = self.ssh.run_command(
                 "ls -d /home/bryck/tsecond-bryck-* 2>/dev/null | head -1"
@@ -1859,7 +1863,7 @@ class PostDeployDesktopAndNetwork(SetupTask):
         # Reload after changes
         self.ssh.run_command("systemctl reload NetworkManager", use_sudo=True)
 
-        # --- Step 8: Install pyroute2==0.7.12 in bryck venv ---
+        # --- Step 8: Install pyroute2==0.7.12, boto3, netifaces in bryck venv ---
         self.logger.info("  Installing pyroute2==0.7.12 in bryck venv...")
         exit_code, _, err = self.ssh.run_command(
             "/opt/bryck/.venv/bryck/bin/pip3 install pyroute2==0.7.12", use_sudo=True
@@ -1868,6 +1872,24 @@ class PostDeployDesktopAndNetwork(SetupTask):
             self.logger.warning(f"  pyroute2 venv install issue: {err}")
         else:
             self.logger.info("  pyroute2==0.7.12 installed in venv.")
+
+        self.logger.info("  Installing boto3 in bryck venv...")
+        exit_code, _, err = self.ssh.run_command(
+            "/opt/bryck/.venv/bryck/bin/pip3 install boto3", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.warning(f"  boto3 venv install issue: {err}")
+        else:
+            self.logger.info("  boto3 installed in venv.")
+
+        self.logger.info("  Installing netifaces in bryck venv...")
+        exit_code, _, err = self.ssh.run_command(
+            "/opt/bryck/.venv/bryck/bin/pip3 install netifaces", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.warning(f"  netifaces venv install issue: {err}")
+        else:
+            self.logger.info("  netifaces installed in venv.")
 
         # --- Step 9: Disable cloud network config ---
         self.logger.info("  Disabling cloud network config...")
@@ -2079,11 +2101,303 @@ Examples:
         default=None,
         help="Bryck build name, e.g. 'tsecond-bryck-5.0.0.15' (without .tar.gz)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Print all commands that would be executed without connecting to the device.",
+    )
+    parser.add_argument(
+        "--device-type",
+        choices=["bryckmini", "bryckserver"],
+        default=None,
+        help="Device type for dry-run (required with --dry-run since no SSH detection occurs).",
+    )
     return parser.parse_args()
+
+
+def dry_run_report(config: DeviceConfig) -> None:
+    """
+    Print a full report of all commands that would be executed on the target
+    device, organized by task. No SSH connection is made.
+    """
+    device = config.bryck_type.value
+    build = config.bryck_build or "<not specified>"
+
+    # Determine architecture-dependent values
+    if config.bryck_type == BryckType.BRYCKMINI:
+        inventory_type = "mini"
+        arch_suffix = "arm64"
+        build_server_ip = "192.168.6.193"
+    else:
+        inventory_type = "bryck"
+        arch_suffix = "amd64"
+        build_server_ip = "192.168.6.28"
+
+    tarball = f"{build}-{arch_suffix}.tar.gz" if config.bryck_build else "<build>.tar.gz"
+    deploy_dir = f"/home/bryck/{build}" if config.bryck_build else "/home/bryck/<build>"
+
+    print("=" * 70)
+    print(f"  BRYCK SETUP - DRY RUN REPORT")
+    print(f"  Target: {config.ip}:{config.ssh_port}")
+    print(f"  User: {config.username}")
+    print(f"  Device Type: {device}")
+    print(f"  Build: {build}")
+    print("=" * 70)
+    print()
+
+    task_num = 0
+
+    # --- Task 1: Configure DNS ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure DNS (/etc/resolv.conf)")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  cat /etc/resolv.conf")
+    print(f"  [SUDO]   unlink /etc/resolv.conf")
+    print(f"  [SUDO]   bash -c 'echo \"nameserver 8.8.8.8\" > /etc/resolv.conf'")
+    print(f"  [VERIFY] cat /etc/resolv.conf")
+    print()
+
+    # --- Task 2: Create Users ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Create Users (bryck & admin)")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  id bryck")
+    print(f"  [SUDO]   useradd -m -s /bin/bash bryck")
+    print(f"  [SUDO]   bash -c 'echo \"bryck:while(1);\" | chpasswd'")
+    print(f"  [SUDO]   groupdel admin")
+    print(f"  [CHECK]  id admin")
+    print(f"  [SUDO]   useradd -m -s /bin/bash admin")
+    print(f"  [SUDO]   bash -c 'echo \"admin:BryckAdm1n\" | chpasswd'")
+    print()
+
+    # --- Task 3: Configure Sudoers ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure Sudoers (/etc/sudoers)")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   cp /etc/sudoers /etc/sudoers.bak")
+    print(f"  [SUDO]   cat /etc/sudoers")
+    print(f"  [SUDO]   bash -c 'echo -e \"<sudoers entries>\" >> /etc/sudoers'")
+    print(f"           Appends: Cmnd_Alias MORE, Defaults!MORE, bryck/wsgi NOPASSWD, admin ALL")
+    print(f"  [SUDO]   visudo -c")
+    print()
+
+    # --- Task 4: Configure APT Sources ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure APT Sources (/etc/apt/sources.list)")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  cat /etc/apt/sources.list")
+    print(f"  [SUDO]   mv /etc/apt/sources.list /home/bryck/bkp_sources.list")
+    print(f"  [SFTP]   Write /tmp/sources.list.new (tsecond mirror for {'arm64' if config.bryck_type == BryckType.BRYCKMINI else 'amd64'})")
+    print(f"  [SUDO]   mv /tmp/sources.list.new /etc/apt/sources.list")
+    print(f"  [SUDO]   apt update")
+    print()
+
+    # --- Task 5: Install Kernel (bryckserver only) ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Install Kernel 6.5.0-45 & Configure GRUB")
+    print(f"{'─'*70}")
+    if config.bryck_type == BryckType.BRYCKMINI:
+        print(f"  [SKIP]   Not applicable to bryckmini (uses bluefield kernel)")
+    else:
+        print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y \\")
+        print(f"             linux-image-6.5.0-45-generic linux-headers-6.5.0-45-generic")
+        print(f"             linux-modules-6.5.0-45-generic linux-modules-extra-6.5.0-45-generic")
+        print(f"             sshpass vim")
+        print(f"  [READ]   awk -F\\' '/menuentry/' /boot/grub/grub.cfg")
+        print(f"  [SUDO]   sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=\"1>...\"/'' /etc/default/grub")
+        print(f"  [SUDO]   update-grub")
+    print()
+
+    # --- Task 6: Set Hostname ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Set Hostname")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   hostnamectl set-hostname {device}")
+    print(f"  [SUDO]   bash -c 'echo \"127.0.1.1 {device}\" >> /etc/hosts'")
+    print()
+
+    # --- Task 7: Disable GRUB Password ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Disable GRUB Password (/etc/grub.d/40_custom)")
+    print(f"{'─'*70}")
+    if config.bryck_type == BryckType.BRYCKMINI:
+        print(f"  [SKIP]   Not applicable to bryckmini")
+    else:
+        print(f"  [SUDO]   sed -i 's/^set superusers/#set superusers/' /etc/grub.d/40_custom")
+        print(f"  [SUDO]   sed -i 's/^password_pbkdf2/#password_pbkdf2/' /etc/grub.d/40_custom")
+        print(f"  [SUDO]   update-grub")
+    print()
+
+    # --- Task 8: Reboot & Post-Kernel ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Reboot & Install Post-Kernel Packages")
+    print(f"{'─'*70}")
+    if config.bryck_type == BryckType.BRYCKSERVER:
+        print(f"  [SUDO]   nohup bash -c 'sleep 2 && reboot' &")
+        print(f"  [WAIT]   Wait up to 300s for SSH to come back")
+    else:
+        print(f"  [SKIP]   No reboot needed (bryckmini)")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt-get install -y linux-modules-extra-$(uname -r)")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-$(uname -r)")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt-get install -y network-manager")
+    print()
+
+    # --- Task 9: Configure APT Sandbox ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure APT Sandbox")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   bash -c 'echo \'APT::Sandbox::User \"root\";\'  > /etc/apt/apt.conf.d/10sandbox'")
+    print()
+
+    # --- Task 10: Install Packages & SDKs ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Install Packages & Cloud SDKs")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   apt-get update")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt --fix-broken install -y")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y \\")
+    print(f"             python3 python3-pip vsftpd sysbench net-tools ethtool")
+    print(f"             cryptsetup fio unzip pkg-config libsystemd-dev")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y \\")
+    print(f"             rclone curl jq sysbench")
+    print(f"  [SUDO]   pip3 install ansible")
+    print(f"  [SUDO]   pip3 install pyroute2")
+    print(f"  [SUDO]   pip3 install boto3")
+    print(f"  [SUDO]   pip3 install netifaces")
+    print(f"  [SUDO]   chmod +x /etc/rc.local")
+    print(f"  [SUDO]   curl + gpg -> /usr/share/keyrings/cloud.google.gpg")
+    print(f"  [SUDO]   Add Google Cloud SDK apt source")
+    print(f"  [SUDO]   pip3 install --no-cache-dir -U crcmod")
+    print(f"  [SUDO]   curl + gpg -> /usr/share/keyrings/microsoft.gpg")
+    print(f"  [SUDO]   Add Azure CLI apt source")
+    print()
+
+    # --- Task 11: Flush IPTables ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Flush IPTables (Network Setup)")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   rm -f /etc/iptables/rules.*")
+    print(f"  [SUDO]   iptables -w 5 -P INPUT ACCEPT")
+    print(f"  [SUDO]   iptables -w 5 -P FORWARD ACCEPT")
+    print(f"  [SUDO]   iptables -w 5 -P OUTPUT ACCEPT")
+    print(f"  [SUDO]   iptables -w 5 -t nat -F")
+    print(f"  [SUDO]   iptables -w 5 -t mangle -F")
+    print(f"  [SUDO]   iptables -w 5 -F")
+    print(f"  [SUDO]   iptables -w 5 -X")
+    print(f"  [SUDO]   ip6tables -w 5  (same as above for IPv6)")
+    print(f"  [SUDO]   mkdir -p /etc/iptables")
+    print(f"  [SUDO]   iptables-save > /etc/iptables/rules.v4")
+    print()
+
+    # --- Task 12: Configure NetworkManager, SSL & SSH Keys ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure NetworkManager, SSL & SSH Keys")
+    print(f"{'─'*70}")
+    print(f"  [SFTP]   Write /tmp/10-globally-managed-devices.conf:")
+    print(f"             [keyfile]")
+    print(f"             unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma,except:type:ethernet")
+    print(f"  [SUDO]   mv /tmp/10-globally-managed-devices.conf /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf")
+    print(f"  [SUDO]   openssl req -x509 -newkey ec ... -out /etc/ssl/certs/bryckweb-selfsigned.crt")
+    print(f"  [SUDO]   mkdir -p /home/bryck/.ssh && chown/chmod")
+    print(f"  [SUDO]   su - bryck -c 'ssh-keygen -t rsa -N \"\" -f /home/bryck/.ssh/id_rsa'")
+    print(f"  [SUDO]   su - bryck -c 'sshpass -p ... ssh-copy-id bryck@localhost'")
+    print()
+
+    # --- Task 13: Deploy Bryck Build ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Deploy Bryck Build")
+    print(f"{'─'*70}")
+    if not config.bryck_build:
+        print(f"  [SKIP]   No --bryck-build specified")
+    else:
+        print(f"  [SUDO]   systemctl stop 'bryck*'")
+        print(f"  [SUDO]   systemctl stop bryckweb bryckutil bryckmonitor")
+        print(f"  [SUDO]   su - bryck -c 'cd <existing_dir> && python3 bryckdeploy uninstall -v'")
+        print(f"  [SUDO]   rm -rf /opt/bryck  (if uninstall fails)")
+        print(f"  [SUDO]   sshpass -p '...' scp {build_server_ip}:/home/bryck/builds/{tarball} /home/bryck/{tarball}")
+        print(f"  [SUDO]   wget -q -O /home/bryck/inventory http://repos.tsecond.ai/ubuntu/inventory")
+        print(f"  [SUDO]   sed -i 's/^bryck_type=.*/bryck_type={inventory_type}/' /home/bryck/inventory")
+        print(f"  [SUDO]   tar -xzf /home/bryck/{tarball} -C /home/bryck/")
+        print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades libjq1=... jq=...")
+        print(f"  [BG]     su - bryck -c 'cd {deploy_dir} && python3 bryckdeploy install -v'")
+        print(f"  [WAIT]   Monitor /opt/ansible/ansible.log for up to 40 minutes")
+        print(f"  [SUDO]   sed -i ... /etc/bryck/bryckutil/config.json  (enable_hot_plug=False, bryck_type={inventory_type})")
+        print(f"  [SUDO]   echo 'export HAILO_MONITOR=1' >> /etc/bash.bashrc")
+    print()
+
+    # --- Task 14: Post-Deploy Desktop & Network ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Post-Deploy Desktop & Network Config")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y xfce4 xfce4-goodies")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y xrdp")
+    print(f"  [SUDO]   systemctl disable netfilter-persistent openibd")
+    print(f"  [SUDO]   nmcli device set oob_net0 managed yes")
+    print(f"  [SUDO]   nmcli connection modify oob_net0 autoconnect yes")
+    print(f"  [SUDO]   nmcli device connect oob_net0")
+    print(f"  [SUDO]   nmcli device reapply oob_net0")
+    print(f"  [SFTP]   Write /tmp/40-mlnx.conf:")
+    print(f"             [keyfile]")
+    print(f"             #unmanaged-devices+=driver:mlx5_core;driver:mlx5e_rep;driver:vxlan")
+    print(f"  [SUDO]   mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf")
+    print(f"  [SUDO]   systemctl reload NetworkManager.service")
+    print(f"  [SUDO]   systemctl disable --now systemd-networkd.service systemd-networkd.socket networkd-dispatcher.service")
+    print(f"  [SUDO]   systemctl restart NetworkManager")
+    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt purge -y netplan netplan.io")
+    print(f"  [SUDO]   nmcli connection modify 'netplan-oob_net0' con-name 'oob_net0'")
+    print(f"  [SUDO]   nmcli connection add type ethernet con-name p0 ifname p0 autoconnect yes")
+    print(f"  [SUDO]   nmcli connection add type ethernet con-name p1 ifname p1 autoconnect yes")
+    print(f"  [SUDO]   systemctl reload NetworkManager")
+    print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install pyroute2==0.7.12")
+    print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install boto3")
+    print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install netifaces")
+    print(f"  [SFTP]   Write /tmp/99-disable-network-config.cfg: {{config: disabled}}")
+    print(f"  [SUDO]   mkdir -p /etc/cloud/cloud.cfg.d")
+    print(f"  [SUDO]   mv /tmp/99-disable-network-config.cfg /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg")
+    print(f"  [SUDO]   sed -i 's/^dns=/#dns=/' /etc/NetworkManager/system-connections/tmfifo_net0.nmconnection")
+    print(f"  [SUDO]   sed -i 's/^route1=/#route1=/' /etc/NetworkManager/system-connections/tmfifo_net0.nmconnection")
+    print(f"  [SUDO]   systemctl reload NetworkManager")
+    print()
+
+    print("=" * 70)
+    print(f"  END OF DRY RUN - {task_num} tasks, no commands were executed.")
+    print("=" * 70)
 
 
 def main() -> None:
     args = parse_args()
+
+    # Handle dry-run mode
+    if args.dry_run:
+        if not args.device_type:
+            print("ERROR: --device-type is required with --dry-run (no SSH to auto-detect).")
+            print("       Use: --device-type bryckmini  OR  --device-type bryckserver")
+            sys.exit(1)
+        config = DeviceConfig(
+            ip=args.ip,
+            username=args.username,
+            password=args.password,
+            bryck_type=BryckType(args.device_type),
+            ssh_port=args.port,
+            bryck_build=args.bryck_build,
+        )
+        dry_run_report(config)
+        sys.exit(0)
 
     config = DeviceConfig(
         ip=args.ip,
