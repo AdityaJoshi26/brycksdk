@@ -293,7 +293,7 @@ class ConfigureDNS(SetupTask):
 
         # Step 3: Write the new resolv.conf
         self.logger.info("  Writing nameserver 8.8.8.8 to /etc/resolv.conf...")
-        write_cmd = "bash -c 'echo \"nameserver 8.8.8.8\" > /etc/resolv.conf'"
+        write_cmd = "bash -c 'printf \"nameserver 8.8.8.8\\n\" > /etc/resolv.conf'"
         exit_code, out, err = self.ssh.run_command(write_cmd, use_sudo=True)
 
         if exit_code != 0:
@@ -921,42 +921,61 @@ class RebootAndInstallPostKernel(SetupTask):
         self.logger.info(f"  Running kernel: {kernel_out}")
 
         # Step 4: Install linux-modules-extra for running kernel
-        self.logger.info(f"  Installing linux-modules-extra-{kernel_out}...")
-        exit_code, out, err = self.ssh.run_command(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y linux-modules-extra-$(uname -r)",
-            use_sudo=True,
+        kernel_ver = kernel_out.strip()
+        exit_code, _, _ = self.ssh.run_command(
+            f"dpkg -l linux-modules-extra-{kernel_ver} 2>/dev/null | grep -q '^ii'"
         )
-        if exit_code != 0:
-            self.logger.warning(f"  linux-modules-extra not available or failed: {err}")
-            # Not fatal on bryckmini — package may not exist for bluefield kernel
-            if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
-                return False
+        if exit_code == 0:
+            self.logger.info(f"  linux-modules-extra-{kernel_ver} already installed. Skipping.")
         else:
-            self.logger.info("  linux-modules-extra installed.")
+            self.logger.info(f"  Installing linux-modules-extra-{kernel_ver}...")
+            exit_code, out, err = self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y linux-modules-extra-$(uname -r)",
+                use_sudo=True,
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  linux-modules-extra not available or failed: {err}")
+                # Not fatal on bryckmini — package may not exist for bluefield kernel
+                if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
+                    return False
+            else:
+                self.logger.info("  linux-modules-extra installed.")
 
         # Step 5: Install linux-headers for running kernel
-        self.logger.info(f"  Installing linux-headers-{kernel_out}...")
-        exit_code, out, err = self.ssh.run_command(
-            "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-$(uname -r)",
-            use_sudo=True,
+        exit_code, _, _ = self.ssh.run_command(
+            f"dpkg -l linux-headers-{kernel_ver} 2>/dev/null | grep -q '^ii'"
         )
-        if exit_code != 0:
-            self.logger.warning(f"  linux-headers not available or failed: {err}")
-            if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
-                return False
+        if exit_code == 0:
+            self.logger.info(f"  linux-headers-{kernel_ver} already installed. Skipping.")
         else:
-            self.logger.info("  linux-headers installed.")
+            self.logger.info(f"  Installing linux-headers-{kernel_ver}...")
+            exit_code, out, err = self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-$(uname -r)",
+                use_sudo=True,
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  linux-headers not available or failed: {err}")
+                if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
+                    return False
+            else:
+                self.logger.info("  linux-headers installed.")
 
         # Step 6: Install network-manager
-        self.logger.info("  Installing network-manager...")
-        exit_code, out, err = self.ssh.run_command(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y network-manager",
-            use_sudo=True,
+        exit_code, _, _ = self.ssh.run_command(
+            "dpkg -l network-manager 2>/dev/null | grep -q '^ii'"
         )
-        if exit_code != 0:
-            self.logger.error(f"  Failed to install network-manager: {err}")
-            return False
-        self.logger.info("  network-manager installed.")
+        if exit_code == 0:
+            self.logger.info("  network-manager already installed. Skipping.")
+        else:
+            self.logger.info("  Installing network-manager...")
+            exit_code, out, err = self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y network-manager",
+                use_sudo=True,
+            )
+            if exit_code != 0:
+                self.logger.error(f"  Failed to install network-manager: {err}")
+                return False
+            self.logger.info("  network-manager installed.")
 
         self.logger.info("  Reboot & post-kernel install completed successfully.")
         return True
@@ -1034,6 +1053,7 @@ class InstallPackagesAndSDKs(SetupTask):
     APT_PACKAGES_BATCH1 = [
         "python3", "python3-pip", "vsftpd", "sysbench", "net-tools",
         "ethtool", "cryptsetup", "fio", "unzip", "pkg-config", "libsystemd-dev",
+        "krb5-user",  # Kerberos auth support; DEBIAN_FRONTEND=noninteractive suppresses realm prompts
     ]
 
     APT_PACKAGES_BATCH2 = [
@@ -1075,6 +1095,12 @@ class InstallPackagesAndSDKs(SetupTask):
 
         # Step 3: Install pip packages
         for pkg in self.PIP_PACKAGES:
+            # Check if already installed
+            pkg_name = pkg.split("==")[0]  # handle pinned versions like pyroute2==0.7.12
+            exit_code, _, _ = self.ssh.run_command(f"pip3 show {pkg_name} >/dev/null 2>&1")
+            if exit_code == 0:
+                self.logger.info(f"  pip package '{pkg_name}' already installed. Skipping.")
+                continue
             self.logger.info(f"  Installing pip package: {pkg}")
             exit_code, out, err = self.ssh.run_command(
                 f"pip3 install {pkg}", use_sudo=True
@@ -1118,6 +1144,22 @@ class InstallPackagesAndSDKs(SetupTask):
         else:
             self.logger.info("  Google Cloud SDK repo already configured. Skipping.")
 
+        # Install google-cloud-cli
+        self.logger.info("  Installing google-cloud-cli...")
+        exit_code, _, _ = self.ssh.run_command("which gcloud")
+        if exit_code == 0:
+            self.logger.info("  google-cloud-cli already installed. Skipping.")
+        else:
+            self.ssh.run_command("apt-get update", use_sudo=True)
+            exit_code, _, err = self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y google-cloud-cli",
+                use_sudo=True,
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  google-cloud-cli install failed: {err}")
+            else:
+                self.logger.info("  google-cloud-cli installed.")
+
         # Step 6: Install crcmod
         self.logger.info("  Installing crcmod...")
         exit_code, _, err = self.ssh.run_command(
@@ -1153,6 +1195,55 @@ class InstallPackagesAndSDKs(SetupTask):
             self.logger.info(f"  Azure CLI repo added (arch={arch}, codename={codename}).")
         else:
             self.logger.info("  Azure CLI repo already configured. Skipping.")
+
+        # Install azure-cli
+        self.logger.info("  Installing azure-cli...")
+        exit_code, _, _ = self.ssh.run_command("which az")
+        if exit_code == 0:
+            self.logger.info("  azure-cli already installed. Skipping.")
+        else:
+            self.ssh.run_command("apt-get update", use_sudo=True)
+            exit_code, _, err = self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y azure-cli",
+                use_sudo=True,
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  azure-cli install failed: {err}")
+            else:
+                self.logger.info("  azure-cli installed.")
+
+        # Step 8: Install AWS CLI v2
+        self.logger.info("  Installing AWS CLI v2...")
+        exit_code, _, _ = self.ssh.run_command("which aws")
+        if exit_code == 0:
+            self.logger.info("  AWS CLI already installed. Skipping.")
+        else:
+            if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
+                aws_url = "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"
+            else:
+                aws_url = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+            self.logger.info(f"  Downloading AWS CLI from {aws_url}...")
+            exit_code, _, err = self.ssh.run_command(
+                f"curl -fsSL {aws_url} -o /tmp/awscliv2.zip", use_sudo=True
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  AWS CLI download failed: {err}")
+            else:
+                exit_code, _, err = self.ssh.run_command(
+                    "unzip -o /tmp/awscliv2.zip -d /tmp/", use_sudo=True
+                )
+                if exit_code != 0:
+                    self.logger.warning(f"  AWS CLI unzip failed: {err}")
+                else:
+                    exit_code, _, err = self.ssh.run_command(
+                        "/tmp/aws/install --update", use_sudo=True
+                    )
+                    if exit_code != 0:
+                        self.logger.warning(f"  AWS CLI install failed: {err}")
+                    else:
+                        exit_code, ver_out, _ = self.ssh.run_command("aws --version")
+                        self.logger.info(f"  AWS CLI installed: {ver_out}")
+                self.ssh.run_command("rm -rf /tmp/awscliv2.zip /tmp/aws", use_sudo=True)
 
         self.logger.info("  All packages and SDK repos configured successfully.")
         return True
@@ -1745,6 +1836,92 @@ class DeployBryckBuild(SetupTask):
             self.logger.info("  HAILO_MONITOR=1 added to /etc/bash.bashrc.")
 
 
+class ConfigureNFSExport(SetupTask):
+    """
+    Task: Validate and fix NFS export options in Ansible configuration.
+
+    Ensures anonuid and anongid in /opt/ansible/roles/add-export/vars/main.yml
+    match the actual UID and GID of the bryck user. This is required for
+    correct NFS access permissions on the Bryck mount point.
+
+    Applies to both bryckserver and bryckmini.
+    Skipped gracefully if /opt/ansible does not exist (deploy was skipped).
+    """
+
+    name = "Configure NFS Export (anonuid/anongid)"
+    NFS_VARS_FILE = "/opt/ansible/roles/add-export/vars/main.yml"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Step 1: Check if the file exists (requires a completed deploy)
+        self.logger.info(f"  Checking {self.NFS_VARS_FILE}...")
+        exit_code, _, _ = self.ssh.run_command(f"test -f {self.NFS_VARS_FILE}", use_sudo=True)
+        if exit_code != 0:
+            self.logger.info("  File not found — deploy may have been skipped. Skipping NFS config.")
+            return True
+
+        # Step 2: Get bryck user UID and GID
+        exit_code, uid_out, err = self.ssh.run_command("id -u bryck")
+        if exit_code != 0:
+            self.logger.error(f"  Could not get bryck UID: {err}")
+            return False
+        bryck_uid = uid_out.strip()
+
+        exit_code, gid_out, err = self.ssh.run_command("id -g bryck")
+        if exit_code != 0:
+            self.logger.error(f"  Could not get bryck GID: {err}")
+            return False
+        bryck_gid = gid_out.strip()
+
+        self.logger.info(f"  bryck user: uid={bryck_uid}, gid={bryck_gid}")
+
+        # Step 3: Read current file content
+        exit_code, current_content, _ = self.ssh.run_command(
+            f"cat {self.NFS_VARS_FILE}", use_sudo=True
+        )
+        self.logger.info(f"  Current content:\n{current_content}")
+
+        # Step 4: Check if already correct
+        if f"anonuid={bryck_uid}" in current_content and f"anongid={bryck_gid}" in current_content:
+            self.logger.info("  anonuid/anongid already match bryck UID/GID. Skipping.")
+            return True
+
+        # Step 5: Update anonuid
+        self.logger.info(f"  Setting anonuid={bryck_uid}...")
+        exit_code, _, err = self.ssh.run_command(
+            f"sed -i 's/anonuid=[0-9]*/anonuid={bryck_uid}/g' {self.NFS_VARS_FILE}",
+            use_sudo=True,
+        )
+        if exit_code != 0:
+            self.logger.error(f"  Failed to update anonuid: {err}")
+            return False
+
+        # Step 6: Update anongid
+        self.logger.info(f"  Setting anongid={bryck_gid}...")
+        exit_code, _, err = self.ssh.run_command(
+            f"sed -i 's/anongid=[0-9]*/anongid={bryck_gid}/g' {self.NFS_VARS_FILE}",
+            use_sudo=True,
+        )
+        if exit_code != 0:
+            self.logger.error(f"  Failed to update anongid: {err}")
+            return False
+
+        # Step 7: Verify
+        self.logger.info("  Verifying configuration...")
+        exit_code, final_content, _ = self.ssh.run_command(
+            f"cat {self.NFS_VARS_FILE}", use_sudo=True
+        )
+        self.logger.info(f"  Final content:\n{final_content}")
+
+        if f"anonuid={bryck_uid}" in final_content and f"anongid={bryck_gid}" in final_content:
+            self.logger.info("  NFS export options configured successfully.")
+            return True
+        else:
+            self.logger.error("  Verification failed — anonuid/anongid not updated correctly.")
+            return False
+
+
 class PostDeployDesktopAndNetwork(SetupTask):
     """
     Task: Post-deployment desktop environment and network configuration.
@@ -1809,7 +1986,40 @@ class PostDeployDesktopAndNetwork(SetupTask):
             "mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf", use_sudo=True
         )
 
-        # --- Step 5: Reload NM, disable systemd-networkd, restart NM ---
+        # --- Step 5: Ensure [ifupdown] managed=true and dns=none in NetworkManager.conf ---
+        self.logger.info("  Configuring /etc/NetworkManager/NetworkManager.conf...")
+        nm_conf = "/etc/NetworkManager/NetworkManager.conf"
+        exit_code, nm_content, _ = self.ssh.run_command(f"cat {nm_conf}", use_sudo=True)
+
+        # Ensure [main] dns=none so NM doesn't overwrite /etc/resolv.conf
+        if "dns=none" not in nm_content:
+            if "[main]" in nm_content:
+                self.ssh.run_command(
+                    f"sed -i '/^\\[main\\]/a dns=none' {nm_conf}", use_sudo=True
+                )
+            else:
+                self.ssh.run_command(
+                    f"printf '\\n[main]\\ndns=none\\n' >> {nm_conf}", use_sudo=True
+                )
+            self.logger.info("  [main] dns=none added (prevents NM from overwriting resolv.conf).")
+        else:
+            self.logger.info("  dns=none already present.")
+
+        # Ensure [ifupdown] managed=true
+        if "[ifupdown]" in nm_content and "managed=true" in nm_content:
+            self.logger.info("  [ifupdown] managed=true already present. Skipping.")
+        else:
+            if "[ifupdown]" in nm_content:
+                self.ssh.run_command(
+                    f"sed -i 's/^managed=false/managed=true/' {nm_conf}", use_sudo=True
+                )
+            else:
+                self.ssh.run_command(
+                    f"printf '\\n[ifupdown]\\nmanaged=true\\n' >> {nm_conf}", use_sudo=True
+                )
+            self.logger.info("  [ifupdown] managed=true configured.")
+
+        # --- Step 6: Reload NM, disable systemd-networkd, restart NM ---
         self.logger.info("  Reloading NetworkManager...")
         self.ssh.run_command("systemctl reload NetworkManager.service", use_sudo=True)
 
@@ -1820,13 +2030,13 @@ class PostDeployDesktopAndNetwork(SetupTask):
         )
         self.ssh.run_command("systemctl restart NetworkManager", use_sudo=True)
 
-        # --- Step 6: Purge netplan ---
+        # --- Step 7: Purge netplan ---
         self.logger.info("  Purging netplan...")
         self.ssh.run_command(
             "DEBIAN_FRONTEND=noninteractive apt purge -y netplan netplan.io", use_sudo=True
         )
 
-        # --- Step 7: Rename interface and add p0/p1 (using nmcli instead of nmtui) ---
+        # --- Step 8: Rename interface and add p0/p1 (using nmcli instead of nmtui) ---
         self.logger.info("  Renaming netplan-oob_net0 to oob_net0...")
         # Check if netplan-oob_net0 connection exists
         exit_code, connections, _ = self.ssh.run_command("nmcli -t -f NAME connection show")
@@ -1863,7 +2073,7 @@ class PostDeployDesktopAndNetwork(SetupTask):
         # Reload after changes
         self.ssh.run_command("systemctl reload NetworkManager", use_sudo=True)
 
-        # --- Step 8: Install pyroute2==0.7.12, boto3, netifaces in bryck venv ---
+        # --- Step 9: Install pyroute2==0.7.12, boto3, netifaces in bryck venv ---
         self.logger.info("  Installing pyroute2==0.7.12 in bryck venv...")
         exit_code, _, err = self.ssh.run_command(
             "/opt/bryck/.venv/bryck/bin/pip3 install pyroute2==0.7.12", use_sudo=True
@@ -1891,7 +2101,7 @@ class PostDeployDesktopAndNetwork(SetupTask):
         else:
             self.logger.info("  netifaces installed in venv.")
 
-        # --- Step 9: Disable cloud network config ---
+        # --- Step 10: Disable cloud network config ---
         self.logger.info("  Disabling cloud network config...")
         try:
             sftp = self.ssh.client.open_sftp()
@@ -1911,7 +2121,7 @@ class PostDeployDesktopAndNetwork(SetupTask):
         )
         self.logger.info("  Cloud network config disabled.")
 
-        # --- Step 10: Disable default route on tmfifo_net0 ---
+        # --- Step 11: Disable default route on tmfifo_net0 ---
         self.logger.info("  Disabling default route on tmfifo_net0...")
         tmfifo_file = "/etc/NetworkManager/system-connections/tmfifo_net0.nmconnection"
         exit_code, _, _ = self.ssh.run_command(f"test -f {tmfifo_file}")
@@ -1929,6 +2139,428 @@ class PostDeployDesktopAndNetwork(SetupTask):
             self.logger.info(f"  {tmfifo_file} not found. Skipping.")
 
         self.logger.info("  Post-deploy desktop & network config completed.")
+        return True
+
+
+class DownloadBryckCLIAndNFSDPatch(SetupTask):
+    """
+    Task: Download BryckCLI and NFSD Patch from TSecond repository.
+
+    - Downloads bryckcli.tar.gz (command-line interface for Bryck operations)
+    - Downloads nfsd_patch.tar.gz (custom NFSD kernel module optimized for Bryck)
+    """
+
+    name = "Download BryckCLI & NFSD Patch"
+
+    DOWNLOADS = [
+        ("http://repos.tsecond.ai/ubuntu/bryckcli.tar.gz", "/home/bryck/bryckcli.tar.gz"),
+        ("http://repos.tsecond.ai/ubuntu/nfsd_patch.tar.gz", "/home/bryck/nfsd_patch.tar.gz"),
+    ]
+
+    def _ensure_dns(self) -> None:
+        """Check DNS resolution and fix /etc/resolv.conf if broken."""
+        self.logger.info("  Checking DNS resolution...")
+        exit_code, _, _ = self.ssh.run_command(
+            "nslookup repos.tsecond.ai >/dev/null 2>&1"
+        )
+        if exit_code == 0:
+            self.logger.info("  DNS is working.")
+            return
+
+        self.logger.warning("  DNS resolution failed. Fixing /etc/resolv.conf...")
+        self.ssh.run_command(
+            "bash -c 'printf \"nameserver 8.8.8.8\\n\" > /etc/resolv.conf'", use_sudo=True
+        )
+        # Verify fix
+        exit_code, _, _ = self.ssh.run_command(
+            "nslookup repos.tsecond.ai >/dev/null 2>&1"
+        )
+        if exit_code == 0:
+            self.logger.info("  DNS fixed successfully.")
+        else:
+            self.logger.error("  DNS still broken after fix attempt.")
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Ensure DNS works (may have been broken by NetworkManager reconfiguration)
+        self._ensure_dns()
+
+        success = True
+        for url, dest in self.DOWNLOADS:
+            filename = dest.split("/")[-1]
+
+            # Check if already downloaded
+            exit_code, _, _ = self.ssh.run_command(f"test -s {dest}", use_sudo=True)
+            if exit_code == 0:
+                self.logger.info(f"  {filename} already exists at {dest}. Skipping.")
+                continue
+
+            self.logger.info(f"  Downloading {url}...")
+            exit_code, _, err = self.ssh.run_command(
+                f"wget {url} -O {dest}", use_sudo=True, timeout=120
+            )
+            if exit_code != 0:
+                self.logger.error(f"  Failed to download {filename}: {err}")
+                success = False
+                continue
+
+            # Verify file was actually downloaded (non-zero size)
+            exit_code, _, _ = self.ssh.run_command(f"test -s {dest}", use_sudo=True)
+            if exit_code != 0:
+                self.logger.error(f"  {filename} download produced empty/missing file.")
+                success = False
+                continue
+
+            # Set ownership
+            self.ssh.run_command(f"chown bryck:bryck {dest}", use_sudo=True)
+            self.logger.info(f"  {filename} downloaded successfully.")
+
+        return success
+
+
+class ApplyNFSDPatchAndRemoveSamba(SetupTask):
+    """
+    Task: Apply NFSD patch and remove Samba services.
+
+    - Stops nfs-server and nfs-kernel-server
+    - Extracts nfsd_patch.tar.gz and runs replace_nfsd_module.sh
+      to replace the default NFSD kernel module with Bryck's custom one
+    - Stops and disables smbd and nmbd (Bryck uses ksmbd instead)
+    - Removes smbd and nmbd service files
+    """
+
+    name = "Apply NFSD Patch & Remove Samba"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # NFSD patch is only for bryckserver (x86-64, kernel 6.5.0-45-generic)
+        # bryckmini uses a different kernel and doesn't need this patch
+        if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
+            self.logger.info("  Skipping NFSD patch: not applicable to bryckmini (different kernel).")
+            # Still remove Samba services on bryckmini
+            self._remove_samba()
+            return True
+
+        # --- Part 1: Apply NFSD Patch ---
+        self.logger.info("  Stopping NFS server...")
+        self.ssh.run_command("systemctl stop nfs-server 2>/dev/null || true", use_sudo=True)
+        self.ssh.run_command("systemctl stop nfs-kernel-server 2>/dev/null || true", use_sudo=True)
+
+        # Check if nfsd_patch.tar.gz exists
+        tarball = "/home/bryck/nfsd_patch.tar.gz"
+        exit_code, _, _ = self.ssh.run_command(f"test -f {tarball}", use_sudo=True)
+        if exit_code != 0:
+            self.logger.error(f"  {tarball} not found. Run DownloadBryckCLIAndNFSDPatch first.")
+            return False
+
+        # Extract nfsd_patch.tar.gz
+        self.logger.info("  Extracting nfsd_patch.tar.gz...")
+        extract_dir = "/home/bryck/nfsd_patch"
+        exit_code, _, err = self.ssh.run_command(
+            f"tar -xzf {tarball} -C /home/bryck/", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.error(f"  Failed to extract nfsd_patch.tar.gz: {err}")
+            return False
+
+        # Run replace_nfsd_module.sh
+        self.logger.info("  Running replace_nfsd_module.sh...")
+        exit_code, out, err = self.ssh.run_command(
+            f"bash {extract_dir}/replace_nfsd_module.sh", use_sudo=True, timeout=120
+        )
+        if exit_code != 0:
+            self.logger.error(f"  replace_nfsd_module.sh failed: {err}")
+            return False
+        self.logger.info(f"  NFSD patch applied successfully.")
+        if out:
+            self.logger.debug(f"  Script output: {out}")
+
+        # --- Part 2: Remove Samba Services ---
+        self._remove_samba()
+
+        self.logger.info("  NFSD patch applied and Samba services removed.")
+        return True
+
+    def _remove_samba(self) -> None:
+        """Stop, disable, and remove Samba service files."""
+        self.logger.info("  Stopping smbd and nmbd...")
+        self.ssh.run_command("systemctl stop smbd nmbd 2>/dev/null || true", use_sudo=True)
+
+        self.logger.info("  Disabling smbd and nmbd...")
+        self.ssh.run_command("systemctl disable smbd nmbd 2>/dev/null || true", use_sudo=True)
+
+        self.logger.info("  Removing smbd and nmbd service files...")
+        self.ssh.run_command(
+            "rm -f /lib/systemd/system/smbd.service /lib/systemd/system/nmbd.service",
+            use_sudo=True,
+        )
+
+        # Reload systemd to pick up removed service files
+        self.ssh.run_command("systemctl daemon-reload", use_sudo=True)
+
+        self.logger.info("  Samba services removed (Bryck uses ksmbd).")
+
+
+class InstallBryckCLI(SetupTask):
+    """
+    Task: Install BryckCLI tool.
+
+    BryckCLI provides a command-line interface to manage all Bryck operations
+    such as Format, Mount, Eject, Erase, and Scan from the terminal.
+
+    - Extracts bryckcli.tar.gz
+    - Runs deploy_bryckcli install
+    - Verifies installation succeeded
+    """
+
+    name = "Install BryckCLI"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Step 1: Check if already installed
+        exit_code, _, _ = self.ssh.run_command("which bryckcli", use_sudo=True)
+        if exit_code == 0:
+            self.logger.info("  BryckCLI already installed. Skipping.")
+            return True
+
+        # Step 2: Verify tarball exists
+        tarball = "/home/bryck/bryckcli.tar.gz"
+        exit_code, _, _ = self.ssh.run_command(f"test -f {tarball}", use_sudo=True)
+        if exit_code != 0:
+            self.logger.error(f"  {tarball} not found. Run DownloadBryckCLIAndNFSDPatch first.")
+            return False
+
+        # Step 3: Extract bryckcli.tar.gz
+        extract_dir = "/home/bryck/bryckcli"
+        self.logger.info("  Extracting bryckcli.tar.gz...")
+        exit_code, _, err = self.ssh.run_command(
+            f"tar -xzf {tarball} -C /home/bryck/", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.error(f"  Failed to extract bryckcli.tar.gz: {err}")
+            return False
+
+        # Step 4: Run deploy_bryckcli install
+        self.logger.info("  Running deploy_bryckcli install...")
+        exit_code, out, err = self.ssh.run_command(
+            f"bash {extract_dir}/deploy_bryckcli install", use_sudo=True, timeout=120
+        )
+        if exit_code != 0:
+            self.logger.error(f"  deploy_bryckcli install failed: {err}")
+            return False
+
+        # Step 5: Verify installation
+        if "Installed" in out:
+            self.logger.info(f"  BryckCLI installed successfully. Output: {out.strip()}")
+        else:
+            # Check if the binary is available even without the expected message
+            exit_code, _, _ = self.ssh.run_command("which bryckcli", use_sudo=True)
+            if exit_code == 0:
+                self.logger.info("  BryckCLI binary found (install output differed from expected).")
+            else:
+                self.logger.error(f"  BryckCLI installation verification failed. Output: {out}")
+                return False
+
+        return True
+
+
+class ConfigureNVMeDrives(SetupTask):
+    """
+    Task: Detect NVMe drive models and OS drive, update config.json.
+
+    - Runs 'nvme list' to detect all NVMe drive models and serial numbers
+    - Appends any new drive models to bryck_drive_model in config.json
+    - Identifies the OS drive (root filesystem) and appends its serial to skip_drives
+    - Only appends, never removes or replaces existing entries
+    """
+
+    name = "Configure NVMe Drives (config.json)"
+    CONFIG_FILE = "/etc/bryck/bryckutil/config.json"
+
+    def _parse_nvme_list(self, output: str) -> list[dict]:
+        """
+        Parse 'nvme list' output into a list of dicts with keys:
+        node, sn, model
+        """
+        drives = []
+        lines = output.splitlines()
+        # Find the header line to determine column positions
+        header_idx = None
+        for i, line in enumerate(lines):
+            if "Node" in line and "SN" in line and "Model" in line:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            return drives
+
+        header = lines[header_idx]
+        # Find column start positions from header
+        node_start = header.find("Node")
+        sn_start = header.find("SN")
+        model_start = header.find("Model")
+        # Find next column after Model (Namespace)
+        ns_start = header.find("Namespace")
+        if ns_start == -1:
+            ns_start = header.find("Usage")
+
+        # Parse data lines (skip header and separator)
+        for line in lines[header_idx + 2:]:
+            if not line.strip() or line.startswith("-"):
+                continue
+            # Extract fields by column positions
+            node = line[node_start:sn_start].strip() if sn_start > node_start else ""
+            sn = line[sn_start:model_start].strip() if model_start > sn_start else ""
+            model = line[model_start:ns_start].strip() if ns_start > model_start else ""
+
+            if node and sn:
+                drives.append({"node": node, "sn": sn, "model": model})
+
+        return drives
+
+    def _get_os_drive_device(self) -> str | None:
+        """Identify the NVMe device holding the root filesystem."""
+        # Get the device for /
+        exit_code, df_out, _ = self.ssh.run_command("df / | tail -1 | awk '{print $1}'")
+        if exit_code != 0 or not df_out.strip():
+            return None
+
+        root_device = df_out.strip()  # e.g. /dev/nvme0n1p1 or /dev/nvme0n1
+
+        # Strip partition number to get the base device (e.g. /dev/nvme0n1p1 -> /dev/nvme0n1)
+        # NVMe partitions are like /dev/nvme0n1p1, base is /dev/nvme0n1
+        if "nvme" in root_device:
+            # Remove trailing pN (partition)
+            import re
+            base = re.sub(r'p\d+$', '', root_device)
+            return base
+
+        return None
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Step 1: Check if config.json exists
+        exit_code, _, _ = self.ssh.run_command(f"test -f {self.CONFIG_FILE}", use_sudo=True)
+        if exit_code != 0:
+            self.logger.info(f"  {self.CONFIG_FILE} not found (deploy may have been skipped). Skipping.")
+            return True
+
+        # Step 2: Run nvme list
+        self.logger.info("  Running nvme list...")
+        exit_code, nvme_out, err = self.ssh.run_command("nvme list", use_sudo=True)
+        if exit_code != 0:
+            self.logger.error(f"  nvme list failed: {err}")
+            return False
+
+        self.logger.info(f"  nvme list output:\n{nvme_out}")
+
+        # Step 3: Parse drive info
+        drives = self._parse_nvme_list(nvme_out)
+        if not drives:
+            self.logger.warning("  No NVMe drives detected. Skipping.")
+            return True
+
+        self.logger.info(f"  Detected {len(drives)} NVMe drive(s):")
+        for d in drives:
+            self.logger.info(f"    {d['node']} | SN: {d['sn']} | Model: {d['model']}")
+
+        # Step 4: Read current config.json
+        self.logger.info(f"  Reading {self.CONFIG_FILE}...")
+        exit_code, config_content, err = self.ssh.run_command(
+            f"cat {self.CONFIG_FILE}", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.error(f"  Failed to read config.json: {err}")
+            return False
+
+        import json
+        try:
+            config = json.loads(config_content)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"  Failed to parse config.json: {e}")
+            return False
+
+        # Step 5: Update bryck_drive_model (append new models only)
+        existing_models = config.get("bryck_drive_model", [])
+        new_models = []
+        for d in drives:
+            model = d["model"]
+            if model and model not in existing_models:
+                new_models.append(model)
+
+        if new_models:
+            self.logger.info(f"  Appending new drive models: {new_models}")
+            config["bryck_drive_model"] = existing_models + new_models
+        else:
+            self.logger.info("  All drive models already in config. No changes needed.")
+
+        # Step 6: Identify OS drive and add its serial to skip_drives
+        self.logger.info("  Identifying OS drive...")
+        os_device = self._get_os_drive_device()
+        existing_skip = config.get("skip_drives", [])
+        new_skips = []
+
+        if os_device:
+            self.logger.info(f"  OS root filesystem is on: {os_device}")
+            # Find the serial number of the OS drive
+            for d in drives:
+                if d["node"] == os_device:
+                    if d["sn"] not in existing_skip:
+                        new_skips.append(d["sn"])
+                        self.logger.info(f"  Adding OS drive SN to skip_drives: {d['sn']}")
+                    else:
+                        self.logger.info(f"  OS drive SN {d['sn']} already in skip_drives.")
+                    break
+            else:
+                self.logger.warning(f"  Could not find {os_device} in nvme list output.")
+        else:
+            self.logger.info("  OS drive is not NVMe. No skip_drives update needed.")
+
+        if new_skips:
+            config["skip_drives"] = existing_skip + new_skips
+
+        # Step 7: Write updated config.json if changes were made
+        if not new_models and not new_skips:
+            self.logger.info("  No config changes needed.")
+            return True
+
+        self.logger.info(f"  Writing updated {self.CONFIG_FILE}...")
+        updated_content = json.dumps(config, indent=4)
+
+        try:
+            sftp = self.ssh.client.open_sftp()
+            with sftp.file("/tmp/config.json.new", "w") as f:
+                f.write(updated_content + "\n")
+            sftp.close()
+        except Exception as e:
+            self.logger.error(f"  SFTP write failed: {e}")
+            return False
+
+        exit_code, _, err = self.ssh.run_command(
+            f"mv /tmp/config.json.new {self.CONFIG_FILE}", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.error(f"  Failed to move config.json: {err}")
+            return False
+
+        # Step 8: Verify
+        exit_code, verify_content, _ = self.ssh.run_command(
+            f"cat {self.CONFIG_FILE}", use_sudo=True
+        )
+        try:
+            verify_config = json.loads(verify_content)
+            final_models = verify_config.get("bryck_drive_model", [])
+            final_skips = verify_config.get("skip_drives", [])
+            self.logger.info(f"  Final bryck_drive_model ({len(final_models)} entries): {final_models}")
+            self.logger.info(f"  Final skip_drives ({len(final_skips)} entries): {final_skips}")
+        except json.JSONDecodeError:
+            self.logger.warning("  Could not re-parse config for verification.")
+
+        self.logger.info("  NVMe drive configuration updated successfully.")
         return True
 
 
@@ -1951,7 +2583,12 @@ TASK_REGISTRY: list[type[SetupTask]] = [
     FlushIPTables,
     ConfigureNetworkManagerAndSSL,
     DeployBryckBuild,
+    ConfigureNFSExport,
     PostDeployDesktopAndNetwork,
+    DownloadBryckCLIAndNFSDPatch,
+    ApplyNFSDPatchAndRemoveSamba,
+    InstallBryckCLI,
+    ConfigureNVMeDrives,
     # Add future tasks below:
     # ...
 ]
@@ -2268,7 +2905,7 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt --fix-broken install -y")
     print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y \\")
     print(f"             python3 python3-pip vsftpd sysbench net-tools ethtool")
-    print(f"             cryptsetup fio unzip pkg-config libsystemd-dev")
+    print(f"             cryptsetup fio unzip pkg-config libsystemd-dev krb5-user")
     print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y \\")
     print(f"             rclone curl jq sysbench")
     print(f"  [SUDO]   pip3 install ansible")
@@ -2278,9 +2915,16 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   chmod +x /etc/rc.local")
     print(f"  [SUDO]   curl + gpg -> /usr/share/keyrings/cloud.google.gpg")
     print(f"  [SUDO]   Add Google Cloud SDK apt source")
+    print(f"  [SUDO]   apt-get update && apt-get install -y google-cloud-cli")
     print(f"  [SUDO]   pip3 install --no-cache-dir -U crcmod")
     print(f"  [SUDO]   curl + gpg -> /usr/share/keyrings/microsoft.gpg")
     print(f"  [SUDO]   Add Azure CLI apt source")
+    print(f"  [SUDO]   apt-get update && apt-get install -y azure-cli")
+    aws_arch = 'aarch64' if config.bryck_type == BryckType.BRYCKMINI else 'x86_64'
+    print(f"  [SUDO]   curl awscli-exe-linux-{aws_arch}.zip -o /tmp/awscliv2.zip")
+    print(f"  [SUDO]   unzip /tmp/awscliv2.zip -d /tmp/")
+    print(f"  [SUDO]   /tmp/aws/install --update")
+    print(f"  [SUDO]   rm -rf /tmp/awscliv2.zip /tmp/aws")
     print()
 
     # --- Task 11: Flush IPTables ---
@@ -2339,7 +2983,21 @@ def dry_run_report(config: DeviceConfig) -> None:
         print(f"  [SUDO]   echo 'export HAILO_MONITOR=1' >> /etc/bash.bashrc")
     print()
 
-    # --- Task 14: Post-Deploy Desktop & Network ---
+    # --- Task 14: Configure NFS Export ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure NFS Export (anonuid/anongid)")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  test -f /opt/ansible/roles/add-export/vars/main.yml")
+    print(f"  [RUN]    id -u bryck  (detect UID)")
+    print(f"  [RUN]    id -g bryck  (detect GID)")
+    print(f"  [SUDO]   cat /opt/ansible/roles/add-export/vars/main.yml")
+    print(f"  [SUDO]   sed -i 's/anonuid=[0-9]*/anonuid=<uid>/g' ...")
+    print(f"  [SUDO]   sed -i 's/anongid=[0-9]*/anongid=<gid>/g' ...")
+    print(f"  [VERIFY] cat /opt/ansible/roles/add-export/vars/main.yml")
+    print()
+
+    # --- Task 15: Post-Deploy Desktop & Network ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Post-Deploy Desktop & Network Config")
@@ -2372,6 +3030,59 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   sed -i 's/^dns=/#dns=/' /etc/NetworkManager/system-connections/tmfifo_net0.nmconnection")
     print(f"  [SUDO]   sed -i 's/^route1=/#route1=/' /etc/NetworkManager/system-connections/tmfifo_net0.nmconnection")
     print(f"  [SUDO]   systemctl reload NetworkManager")
+    print()
+
+    # --- Task 16: Download BryckCLI & NFSD Patch ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Download BryckCLI & NFSD Patch")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  test -f /home/bryck/bryckcli.tar.gz")
+    print(f"  [SUDO]   wget -q -O /home/bryck/bryckcli.tar.gz http://repos.tsecond.ai/ubuntu/bryckcli.tar.gz")
+    print(f"  [CHECK]  test -f /home/bryck/nfsd_patch.tar.gz")
+    print(f"  [SUDO]   wget -q -O /home/bryck/nfsd_patch.tar.gz http://repos.tsecond.ai/ubuntu/nfsd_patch.tar.gz")
+    print(f"  [SUDO]   chown bryck:bryck /home/bryck/bryckcli.tar.gz /home/bryck/nfsd_patch.tar.gz")
+    print()
+
+    # --- Task 17: Apply NFSD Patch & Remove Samba ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Apply NFSD Patch & Remove Samba")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   systemctl stop nfs-server")
+    print(f"  [SUDO]   systemctl stop nfs-kernel-server")
+    print(f"  [SUDO]   tar -xzf /home/bryck/nfsd_patch.tar.gz -C /home/bryck/")
+    print(f"  [SUDO]   bash /home/bryck/nfsd_patch/replace_nfsd_module.sh")
+    print(f"  [SUDO]   systemctl stop smbd nmbd")
+    print(f"  [SUDO]   systemctl disable smbd nmbd")
+    print(f"  [SUDO]   rm -f /lib/systemd/system/smbd.service /lib/systemd/system/nmbd.service")
+    print(f"  [SUDO]   systemctl daemon-reload")
+    print()
+
+    # --- Task 18: Install BryckCLI ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Install BryckCLI")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  which bryckcli")
+    print(f"  [CHECK]  test -f /home/bryck/bryckcli.tar.gz")
+    print(f"  [SUDO]   tar -xzf /home/bryck/bryckcli.tar.gz -C /home/bryck/")
+    print(f"  [SUDO]   bash /home/bryck/bryckcli/deploy_bryckcli install")
+    print(f"  [VERIFY] Expected: 'Bryckcli is Installed. Use the command \"bryckcli\" to manage bryck'")
+    print()
+
+    # --- Task 19: Configure NVMe Drives ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure NVMe Drives (config.json)")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  test -f /etc/bryck/bryckutil/config.json")
+    print(f"  [SUDO]   nvme list")
+    print(f"  [RUN]    df / (identify OS drive)")
+    print(f"  [READ]   cat /etc/bryck/bryckutil/config.json")
+    print(f"  [UPDATE] Append new NVMe models to bryck_drive_model[]")
+    print(f"  [UPDATE] Append OS drive serial to skip_drives[]")
+    print(f"  [SFTP]   Write updated config.json")
     print()
 
     print("=" * 70)
