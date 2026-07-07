@@ -2096,9 +2096,32 @@ class ConfigureNetworkManagerInterfaces(SetupTask):
         # Step 1: Load mlx5_core if not loaded
         exit_code, _, _ = self.ssh.run_command("lsmod | grep -q mlx5_core")
         if exit_code != 0:
-            self.logger.info("  mlx5_core not loaded — loading now...")
-            self.ssh.run_command("modprobe mlx5_core", use_sudo=True)
-            time.sleep(3)
+            # Try to install linux-modules-extra for the running kernel first
+            # (mlx5_core may not be present on BlueField custom kernels until installed)
+            self.logger.info("  mlx5_core not loaded — installing kernel modules if needed...")
+            exit_code, uname_out, _ = self.ssh.run_command("uname -r")
+            kernel = uname_out.strip()
+            self.ssh.run_command(
+                f"DEBIAN_FRONTEND=noninteractive apt-get install -y "
+                f"linux-modules-extra-{kernel} 2>/dev/null || true",
+                use_sudo=True,
+            )
+            self.logger.info("  Loading mlx5_core...")
+            exit_code, _, err = self.ssh.run_command("modprobe mlx5_core", use_sudo=True)
+            if exit_code != 0:
+                self.logger.warning(
+                    f"  modprobe mlx5_core failed: {err}. "
+                    "p0/p1 may require MLNX_OFED or a reboot after package install."
+                )
+            else:
+                self.logger.info("  mlx5_core loaded successfully.")
+                time.sleep(3)
+                # Persist mlx5_core load on boot
+                self.ssh.run_command(
+                    "grep -qxF 'mlx5_core' /etc/modules || echo 'mlx5_core' >> /etc/modules",
+                    use_sudo=True,
+                )
+                self.logger.info("  mlx5_core added to /etc/modules (loads on boot).")
         else:
             self.logger.info("  mlx5_core already loaded.")
 
