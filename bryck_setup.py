@@ -1282,38 +1282,6 @@ class InstallPackagesAndSDKs(SetupTask):
 
         # Step 8: Install AWS CLI v2
         self.logger.info("  Installing AWS CLI v2...")
-
-        # Remove conflicting apt-installed awscli v1 before installing v2.
-        # IMPORTANT: 'apt remove awscli' also removes bryckcloud (which depends on
-        # the awscli apt package). To avoid this, we use 'dpkg --remove --force-depends'
-        # which removes ONLY the awscli package without cascade-removing its dependents.
-        self.logger.info("  Checking for apt awscli v1 (avoids botocore/opsworkscm conflict)...")
-        exit_code, awscli_check, _ = self.ssh.run_command(
-            "dpkg -l awscli 2>/dev/null | grep -q '^ii' && echo INSTALLED || echo NOT_INSTALLED"
-        )
-        if "INSTALLED" in awscli_check:
-            # Check if bryckcloud is installed so we can warn if it will be affected
-            _, bc_check, _ = self.ssh.run_command(
-                "dpkg -l bryckcloud 2>/dev/null | grep -q '^ii' && echo INSTALLED || echo NOT_INSTALLED"
-            )
-            bryckcloud_was_installed = "INSTALLED" in bc_check
-
-            self.logger.info("  Removing awscli v1 via dpkg --force-depends (preserves bryckcloud)...")
-            exit_code, _, err = self.ssh.run_command(
-                "dpkg --remove --force-depends awscli", use_sudo=True
-            )
-            if exit_code != 0:
-                self.logger.warning(f"  Could not remove awscli v1: {err}")
-            else:
-                self.logger.info("  awscli v1 removed.")
-                if bryckcloud_was_installed:
-                    self.logger.info(
-                        "  bryckcloud is still installed. Its apt dependency on awscli v1 is "
-                        "now satisfied at runtime by AWS CLI v2 (/usr/local/bin/aws)."
-                    )
-        else:
-            self.logger.info("  awscli apt package not present. Skipping removal.")
-
         exit_code, _, _ = self.ssh.run_command("/usr/local/bin/aws --version 2>/dev/null")
         if exit_code == 0:
             self.logger.info("  AWS CLI v2 already installed. Skipping.")
