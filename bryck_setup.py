@@ -2061,6 +2061,8 @@ class ConfigureNetworkManagerInterfaces(SetupTask):
     """
     Task: Configure NetworkManager interfaces — runs independently of bryck build.
 
+    - Ensures mlx5 data-path interfaces are named p0/p1 (loads driver, creates
+      udev rename rules by MAC, renames live if needed)
     - Configures oob_net0 (managed, autoconnect, connect, reapply)
     - Writes 40-mlnx.conf (disables Mellanox keyfile)
     - Configures NetworkManager.conf (dns=none, ifupdown managed=true)
@@ -2076,8 +2078,113 @@ class ConfigureNetworkManagerInterfaces(SetupTask):
 
     MLNX_CONF_CONTENT = "[keyfile]\n#unmanaged-devices+=driver:mlx5_core;driver:mlx5e_rep;driver:vxlan\n"
 
+    # Interfaces that are NOT data-path ports (excluded from p0/p1 detection)
+    EXCLUDED_IFACES = {"lo", "oob_net0", "tmfifo_net0", "p0", "p1"}
+
+    def _ensure_p0_p1_interfaces(self) -> None:
+        """
+        Ensure mlx5 data-path interfaces are named p0/p1.
+
+        1. Loads mlx5_core kernel module if not already loaded.
+        2. Discovers mlx5_core interfaces that are not management interfaces.
+        3. If found with non-canonical names, renames them live with 'ip link'.
+        4. Writes /etc/udev/rules.d/70-bryck-net.rules (MAC-based) so the names
+           persist across reboots.
+        """
+        self.logger.info("  Ensuring p0/p1 interfaces exist...")
+
+        # Step 1: Load mlx5_core if not loaded
+        exit_code, _, _ = self.ssh.run_command("lsmod | grep -q mlx5_core")
+        if exit_code != 0:
+            self.logger.info("  mlx5_core not loaded — loading now...")
+            self.ssh.run_command("modprobe mlx5_core", use_sudo=True)
+            time.sleep(3)
+        else:
+            self.logger.info("  mlx5_core already loaded.")
+
+        # Step 2: Check if p0/p1 already exist
+        exit_code, ifaces_out, _ = self.ssh.run_command("ls /sys/class/net/ 2>/dev/null")
+        existing = set(ifaces_out.split())
+        if "p0" in existing and "p1" in existing:
+            self.logger.info("  p0 and p1 already exist. Skipping rename.")
+            return
+
+        # Step 3: Find mlx5_core data-path interfaces (not management ones)
+        find_cmd = (
+            "for iface in $(ls /sys/class/net/ 2>/dev/null); do "
+            "  case $iface in lo|oob_net0|tmfifo_net0|p0|p1) continue ;; esac; "
+            "  driver=$(readlink /sys/class/net/$iface/device/driver 2>/dev/null "
+            "            | xargs basename 2>/dev/null); "
+            '  [ "$driver" = "mlx5_core" ] && echo $iface; '
+            "done"
+        )
+        exit_code, found_out, _ = self.ssh.run_command(find_cmd)
+        found_ifaces = sorted([i.strip() for i in found_out.splitlines() if i.strip()])
+
+        if not found_ifaces:
+            self.logger.warning(
+                "  No mlx5_core data-path interfaces found. "
+                "p0/p1 may appear after bryckdeploy or on reboot."
+            )
+            return
+
+        self.logger.info(f"  Found mlx5 data-path interfaces: {found_ifaces}")
+
+        # Step 4: Map first -> p0, second -> p1
+        mappings = {}
+        if len(found_ifaces) >= 1:
+            mappings[found_ifaces[0]] = "p0"
+        if len(found_ifaces) >= 2:
+            mappings[found_ifaces[1]] = "p1"
+
+        udev_lines = []
+        for old_name, new_name in mappings.items():
+            # Get MAC for udev rule
+            exit_code, mac_out, _ = self.ssh.run_command(
+                f"cat /sys/class/net/{old_name}/address 2>/dev/null"
+            )
+            mac = mac_out.strip()
+            if mac:
+                udev_lines.append(
+                    f'SUBSYSTEM=="net", ACTION=="add", ATTR{{address}}=="{mac}", NAME="{new_name}"'
+                )
+                self.logger.info(f"  {old_name} (mac={mac}) -> {new_name}")
+
+            # Rename live for current session
+            self.logger.info(f"  Renaming {old_name} -> {new_name} live...")
+            exit_code, _, err = self.ssh.run_command(
+                f"ip link set {old_name} down 2>/dev/null; "
+                f"ip link set {old_name} name {new_name} && ip link set {new_name} up",
+                use_sudo=True,
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  Live rename {old_name} -> {new_name} failed: {err}")
+            else:
+                self.logger.info(f"  {new_name} is up.")
+
+        # Step 5: Write udev rules for persistent naming across reboots
+        if udev_lines:
+            rules_content = "\n".join(udev_lines) + "\n"
+            try:
+                sftp = self.ssh.client.open_sftp()
+                with sftp.file("/tmp/70-bryck-net.rules", "w") as f:
+                    f.write(rules_content)
+                sftp.close()
+            except Exception as e:
+                self.logger.warning(f"  Failed to write udev rules via SFTP: {e}")
+                return
+            self.ssh.run_command(
+                "mv /tmp/70-bryck-net.rules /etc/udev/rules.d/70-bryck-net.rules "
+                "&& udevadm control --reload-rules && udevadm trigger",
+                use_sudo=True,
+            )
+            self.logger.info("  Udev rules written: p0/p1 naming will persist on reboot.")
+
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
+
+        # --- Step 0: Ensure p0/p1 interfaces exist (mlx5 driver + udev rename) ---
+        self._ensure_p0_p1_interfaces()
 
         # --- Step 1: Configure oob_net0 ---
         self.logger.info("  Configuring oob_net0 interface...")
