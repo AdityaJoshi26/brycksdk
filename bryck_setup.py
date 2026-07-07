@@ -2719,13 +2719,13 @@ TASK_REGISTRY: list[type[SetupTask]] = [
     FlushIPTables,
     ConfigureNetworkManagerAndSSL,
     DeployBryckBuild,
-    FixConfigJsonPermissions,
     ConfigureNFSExport,
     PostDeployDesktopAndNetwork,
     DownloadBryckCLIAndNFSDPatch,
     ApplyNFSDPatchAndRemoveSamba,
     InstallBryckCLI,
     ConfigureNVMeDrives,
+    FixConfigJsonPermissions,   # Must run last — ConfigureNVMeDrives mv overwrites permissions
     # Add future tasks below:
     # ...
 ]
