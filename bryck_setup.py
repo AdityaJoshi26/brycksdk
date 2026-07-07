@@ -1887,7 +1887,14 @@ class DeployBryckBuild(SetupTask):
                 f'sed -i \'s/"bryck_type": *"[^"]*"/"bryck_type": "{inventory_type}"/\' {config_file}',
                 use_sudo=True,
             )
+            # Restore correct ownership and permissions after sed -i (which creates
+            # a new temp file and may not preserve the original owner/mode)
+            self.ssh.run_command(
+                f"chown bryck:bryck {config_file} && chmod 755 {config_file}",
+                use_sudo=True,
+            )
             self.logger.info(f"  config.json updated (enable_hot_plug=False, bryck_type={inventory_type}).")
+            self.logger.info(f"  config.json ownership restored to bryck:bryck with mode 755.")
         else:
             self.logger.warning(f"  {config_file} not found. Skipping config update.")
 
