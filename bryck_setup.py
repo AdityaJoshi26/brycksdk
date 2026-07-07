@@ -1887,14 +1887,7 @@ class DeployBryckBuild(SetupTask):
                 f'sed -i \'s/"bryck_type": *"[^"]*"/"bryck_type": "{inventory_type}"/\' {config_file}',
                 use_sudo=True,
             )
-            # Restore correct ownership and permissions after sed -i (which creates
-            # a new temp file and may not preserve the original owner/mode)
-            self.ssh.run_command(
-                f"chown bryck:bryck {config_file} && chmod 755 {config_file}",
-                use_sudo=True,
-            )
             self.logger.info(f"  config.json updated (enable_hot_plug=False, bryck_type={inventory_type}).")
-            self.logger.info(f"  config.json ownership restored to bryck:bryck with mode 755.")
         else:
             self.logger.warning(f"  {config_file} not found. Skipping config update.")
 
@@ -1909,6 +1902,73 @@ class DeployBryckBuild(SetupTask):
                 use_sudo=True,
             )
             self.logger.info("  HAILO_MONITOR=1 added to /etc/bash.bashrc.")
+
+
+class FixConfigJsonPermissions(SetupTask):
+    """
+    Task: Ensure /etc/bryck/bryckutil/config.json is owned by bryck:bryck
+    with permissions 755 (-rwxr-xr-x).
+
+    Runs unconditionally (with or without --bryck-build) so that the
+    correct owner/mode is enforced even when the deploy step is skipped.
+    Skips gracefully if the file does not exist yet.
+    """
+
+    name = "Fix config.json Permissions (bryck:bryck 755)"
+    CONFIG_FILE = "/etc/bryck/bryckutil/config.json"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Step 1: Check if the file exists
+        exit_code, _, _ = self.ssh.run_command(f"test -f {self.CONFIG_FILE}")
+        if exit_code != 0:
+            self.logger.info(f"  {self.CONFIG_FILE} not found. Skipping (deploy not yet run).")
+            return True
+
+        # Step 2: Check current ownership and permissions
+        exit_code, stat_out, _ = self.ssh.run_command(
+            f"stat -c '%U %G %a' {self.CONFIG_FILE}", use_sudo=True
+        )
+        parts = stat_out.strip().split()
+        if len(parts) == 3:
+            owner, group, mode = parts
+            self.logger.info(f"  Current: owner={owner}, group={group}, mode={mode}")
+            if owner == "bryck" and group == "bryck" and mode == "755":
+                self.logger.info("  Permissions already correct. Skipping.")
+                return True
+        else:
+            self.logger.warning(f"  Could not parse stat output: '{stat_out}'. Proceeding with fix.")
+
+        # Step 3: Fix ownership
+        self.logger.info(f"  Setting owner bryck:bryck on {self.CONFIG_FILE}...")
+        exit_code, _, err = self.ssh.run_command(
+            f"chown bryck:bryck {self.CONFIG_FILE}", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.error(f"  chown failed: {err}")
+            return False
+
+        # Step 4: Fix permissions
+        self.logger.info(f"  Setting mode 755 on {self.CONFIG_FILE}...")
+        exit_code, _, err = self.ssh.run_command(
+            f"chmod 755 {self.CONFIG_FILE}", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.error(f"  chmod failed: {err}")
+            return False
+
+        # Step 5: Verify
+        exit_code, verify_out, _ = self.ssh.run_command(
+            f"stat -c '%U %G %a' {self.CONFIG_FILE}", use_sudo=True
+        )
+        parts = verify_out.strip().split()
+        if len(parts) == 3 and parts[0] == "bryck" and parts[1] == "bryck" and parts[2] == "755":
+            self.logger.info(f"  config.json permissions fixed: bryck:bryck 755.")
+            return True
+        else:
+            self.logger.error(f"  Verification failed. stat output: '{verify_out}'")
+            return False
 
 
 class ConfigureNFSExport(SetupTask):
@@ -2659,6 +2719,7 @@ TASK_REGISTRY: list[type[SetupTask]] = [
     FlushIPTables,
     ConfigureNetworkManagerAndSSL,
     DeployBryckBuild,
+    FixConfigJsonPermissions,
     ConfigureNFSExport,
     PostDeployDesktopAndNetwork,
     DownloadBryckCLIAndNFSDPatch,
@@ -3071,7 +3132,21 @@ def dry_run_report(config: DeviceConfig) -> None:
         print(f"  [SUDO]   echo 'export HAILO_MONITOR=1' >> /etc/bash.bashrc")
     print()
 
-    # --- Task 14: Configure NFS Export ---
+    # --- Task 14: Fix config.json Permissions ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Fix config.json Permissions (bryck:bryck 755)")
+    print(f"{'─'*70}")
+    print(f"  [CHECK]  test -f /etc/bryck/bryckutil/config.json")
+    print(f"  [SKIP]   if file not found (deploy not yet run)")
+    print(f"  [SUDO]   stat -c '%U %G %a' /etc/bryck/bryckutil/config.json")
+    print(f"  [SKIP]   if already bryck:bryck 755")
+    print(f"  [SUDO]   chown bryck:bryck /etc/bryck/bryckutil/config.json")
+    print(f"  [SUDO]   chmod 755 /etc/bryck/bryckutil/config.json")
+    print(f"  [VERIFY] stat -c '%U %G %a' /etc/bryck/bryckutil/config.json")
+    print()
+
+    # --- Task 15: Configure NFS Export ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Configure NFS Export (anonuid/anongid)")
