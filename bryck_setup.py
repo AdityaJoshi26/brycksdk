@@ -392,6 +392,74 @@ class CreateUsers(SetupTask):
         return success
 
 
+class ReconnectAsBryckUser(SetupTask):
+    """
+    Task: Drop the current SSH session and reconnect as the 'bryck' user.
+
+    Must run immediately after CreateUsers so that all subsequent tasks
+    execute natively as 'bryck' rather than as whatever user initially
+    connected (e.g. ubuntu, root, admin).
+
+    Idempotent: if already connected as 'bryck', logs and skips.
+    """
+
+    name = "Reconnect as bryck User"
+
+    BRYCK_USER = "bryck"
+    BRYCK_PASSWORD = "while(1);"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Step 1: Check who we are right now
+        exit_code, current_user, err = self.ssh.run_command("whoami")
+        current_user = current_user.strip()
+
+        if current_user == self.BRYCK_USER:
+            self.logger.info(f"  Already connected as '{self.BRYCK_USER}'. Skipping reconnect.")
+            return True
+
+        self.logger.info(f"  Currently connected as '{current_user}'. Switching to '{self.BRYCK_USER}'...")
+
+        # Step 2: Verify bryck user actually exists before trying to reconnect
+        exit_code, _, _ = self.ssh.run_command(f"id {self.BRYCK_USER}")
+        if exit_code != 0:
+            self.logger.error(f"  User '{self.BRYCK_USER}' does not exist. Cannot reconnect.")
+            return False
+
+        # Step 3: Update credentials on the shared config so all future
+        #         reconnects (including post-reboot) also use bryck credentials
+        self.ssh.config.username = self.BRYCK_USER
+        self.ssh.config.password = self.BRYCK_PASSWORD
+
+        # Step 4: Close current session and reconnect as bryck
+        self.logger.info(f"  Closing current session and reconnecting as '{self.BRYCK_USER}'...")
+        if self.ssh.client:
+            try:
+                self.ssh.client.close()
+            except Exception:
+                pass
+            self.ssh.client = None
+
+        if not self.ssh.reconnect():
+            self.logger.error(f"  Failed to reconnect as '{self.BRYCK_USER}'.")
+            return False
+
+        # Step 5: Verify the new session is bryck
+        exit_code, verified_user, err = self.ssh.run_command("whoami")
+        verified_user = verified_user.strip()
+
+        if verified_user == self.BRYCK_USER:
+            self.logger.info(f"  Reconnected successfully as '{self.BRYCK_USER}'.")
+            return True
+        else:
+            self.logger.error(
+                f"  Reconnect succeeded but 'whoami' returned '{verified_user}' "
+                f"(expected '{self.BRYCK_USER}')."
+            )
+            return False
+
+
 class ConfigureSudoers(SetupTask):
     """
     Task: Update /etc/sudoers directly.
@@ -2572,6 +2640,7 @@ class ConfigureNVMeDrives(SetupTask):
 TASK_REGISTRY: list[type[SetupTask]] = [
     ConfigureDNS,
     CreateUsers,
+    ReconnectAsBryckUser,
     ConfigureSudoers,
     ConfigureAPTSources,
     InstallKernel,
@@ -2810,7 +2879,19 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   bash -c 'echo \"admin:BryckAdm1n\" | chpasswd'")
     print()
 
-    # --- Task 3: Configure Sudoers ---
+    # --- Task 3: Reconnect as bryck ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Reconnect as bryck User")
+    print(f"{'─'*70}")
+    print(f"  [RUN]    whoami  (check current user)")
+    print(f"  [SKIP]   if already 'bryck', skips reconnect")
+    print(f"  [RUN]    id bryck  (verify user exists)")
+    print(f"  [ACTION] Close SSH session; reconnect as bryck / while(1);")
+    print(f"  [VERIFY] whoami  (confirm new session is bryck)")
+    print()
+
+    # --- Task 4: Configure Sudoers ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Configure Sudoers (/etc/sudoers)")
@@ -2822,7 +2903,7 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   visudo -c")
     print()
 
-    # --- Task 4: Configure APT Sources ---
+    # --- Task 5: Configure APT Sources ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Configure APT Sources (/etc/apt/sources.list)")
