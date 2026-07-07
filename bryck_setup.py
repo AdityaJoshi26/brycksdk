@@ -670,8 +670,7 @@ class InstallKernel(SetupTask):
     """
     Task: Install Linux kernel 6.5.0-45 and configure GRUB to boot it.
 
-    NOTE: Only runs on bryckserver (x86-64). Skipped on bryckmini (arm64)
-    since BlueField-3 DPU uses its own bluefield kernel.
+    Runs on both bryckserver (x86-64) and bryckmini (arm64).
 
     - Installs linux-image, headers, modules, modules-extra for 6.5.0-45-generic
     - Installs sshpass and vim
@@ -695,12 +694,6 @@ class InstallKernel(SetupTask):
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
-        # This task only applies to bryckserver (x86-64)
-        if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
-            self.logger.info("  Skipping: kernel 6.5.0-45-generic is x86-64 only.")
-            self.logger.info("  BlueField-3 DPU uses its own bluefield kernel.")
-            return True
-
         # Step 1: Check if kernel is already installed
         self.logger.info(f"  Checking if kernel {self.KERNEL_VERSION} is already installed...")
         exit_code, out, _ = self.ssh.run_command(
@@ -721,7 +714,14 @@ class InstallKernel(SetupTask):
                 return False
             self.logger.info("  Kernel packages installed successfully.")
 
-        # Step 3: Parse GRUB menu entries to find the correct entry
+        # Step 3: Check if GRUB is already configured for this kernel
+        self.logger.info("  Checking current GRUB_DEFAULT...")
+        exit_code, grub_current, _ = self.ssh.run_command("grep GRUB_DEFAULT /etc/default/grub")
+        if self.KERNEL_VERSION in grub_current:
+            self.logger.info(f"  GRUB already configured for {self.KERNEL_VERSION}. Skipping.")
+            return True
+
+        # Step 4: Parse GRUB menu entries to find the correct entry
         self.logger.info("  Parsing GRUB menu entries...")
         exit_code, grub_entries, err = self.ssh.run_command(
             "awk -F\\' '/menuentry / {print $2}' /boot/grub/grub.cfg"
@@ -745,7 +745,7 @@ class InstallKernel(SetupTask):
 
         self.logger.info(f"  Target GRUB entry: {target_entry}")
 
-        # Step 4: Set GRUB_DEFAULT
+        # Step 5: Set GRUB_DEFAULT
         grub_default = f"1>{target_entry}"
         self.logger.info(f"  Setting GRUB_DEFAULT=\"{grub_default}\"...")
 
@@ -757,11 +757,11 @@ class InstallKernel(SetupTask):
             self.logger.error(f"  Failed to update /etc/default/grub: {err}")
             return False
 
-        # Step 5: Verify GRUB_DEFAULT was set
+        # Step 6: Verify GRUB_DEFAULT was set
         exit_code, grub_content, _ = self.ssh.run_command("grep GRUB_DEFAULT /etc/default/grub")
         self.logger.info(f"  Current GRUB_DEFAULT: {grub_content}")
 
-        # Step 6: Run update-grub
+        # Step 7: Run update-grub
         self.logger.info("  Running update-grub...")
         exit_code, out, err = self.ssh.run_command("update-grub", use_sudo=True)
 
@@ -835,11 +835,6 @@ class DisableGRUBPassword(SetupTask):
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
-        # Only applies to bryckserver (x86-64 with GRUB)
-        if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
-            self.logger.info("  Skipping: GRUB password config not applicable to bryckmini.")
-            return True
-
         # Step 1: Check if the file exists and has the lines
         self.logger.info("  Reading /etc/grub.d/40_custom...")
         exit_code, content, err = self.ssh.run_command("cat /etc/grub.d/40_custom", use_sudo=True)
@@ -904,6 +899,7 @@ class RebootAndInstallPostKernel(SetupTask):
 
     - Reboots the device
     - Waits for SSH to become available again (with retry and backoff)
+    - Verifies kernel 6.5.0-45-generic is running (aborts if not)
     - Installs linux-modules-extra and linux-headers for the running kernel
     - Installs network-manager
     """
@@ -958,32 +954,39 @@ class RebootAndInstallPostKernel(SetupTask):
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
-        # Reboot is only needed on bryckserver (kernel was changed)
-        # On bryckmini, BlueField DPU keeps its existing kernel — no reboot needed
-        if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
-            # Step 1: Initiate reboot
-            self.logger.info("  Initiating reboot (bryckserver: kernel was changed)...")
-            # Use nohup and background to avoid the SSH channel closing mid-command
-            self.ssh.run_command("nohup bash -c 'sleep 2 && reboot' &", use_sudo=True)
-            self.logger.info("  Reboot command sent.")
+        # Step 1: Initiate reboot
+        self.logger.info("  Initiating reboot (kernel was changed)...")
+        # Use nohup and background to avoid the SSH channel closing mid-command
+        self.ssh.run_command("nohup bash -c 'sleep 2 && reboot' &", use_sudo=True)
+        self.logger.info("  Reboot command sent.")
 
-            # Close current connection (it will be dropped anyway)
-            try:
-                self.ssh.client.close()
-            except Exception:
-                pass
-            self.ssh.client = None
+        # Close current connection (it will be dropped anyway)
+        try:
+            self.ssh.client.close()
+        except Exception:
+            pass
+        self.ssh.client = None
 
-            # Step 2: Wait for SSH to come back
-            self.logger.info("  Waiting for device to reboot and SSH to become available...")
-            if not self._wait_for_ssh():
-                return False
+        # Step 2: Wait for SSH to come back
+        self.logger.info("  Waiting for device to reboot and SSH to become available...")
+        if not self._wait_for_ssh():
+            return False
 
-            # Step 3: Verify the machine is up
-            exit_code, uptime_out, _ = self.ssh.run_command("uptime")
-            self.logger.info(f"  Device is up: {uptime_out}")
-        else:
-            self.logger.info("  Skipping reboot (bryckmini: no kernel change).")
+        # Step 3: Verify the machine is up
+        exit_code, uptime_out, _ = self.ssh.run_command("uptime")
+        self.logger.info(f"  Device is up: {uptime_out}")
+
+        # Step 4: Verify the correct kernel is running
+        exit_code, kernel_out, _ = self.ssh.run_command("uname -a")
+        self.logger.info(f"  Kernel check (uname -a): {kernel_out}")
+
+        if "6.5.0-45-generic" not in kernel_out:
+            self.logger.error(
+                f"  KERNEL VERIFICATION FAILED: Expected '6.5.0-45-generic' in uname output, "
+                f"got: {kernel_out}"
+            )
+            return False
+        self.logger.info("  Kernel 6.5.0-45-generic verified successfully.")
 
         exit_code, kernel_out, _ = self.ssh.run_command("uname -r")
         self.logger.info(f"  Running kernel: {kernel_out}")
@@ -1002,10 +1005,8 @@ class RebootAndInstallPostKernel(SetupTask):
                 use_sudo=True,
             )
             if exit_code != 0:
-                self.logger.warning(f"  linux-modules-extra not available or failed: {err}")
-                # Not fatal on bryckmini — package may not exist for bluefield kernel
-                if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
-                    return False
+                self.logger.error(f"  linux-modules-extra installation failed: {err}")
+                return False
             else:
                 self.logger.info("  linux-modules-extra installed.")
 
@@ -1022,9 +1023,8 @@ class RebootAndInstallPostKernel(SetupTask):
                 use_sudo=True,
             )
             if exit_code != 0:
-                self.logger.warning(f"  linux-headers not available or failed: {err}")
-                if self.ssh.config.bryck_type == BryckType.BRYCKSERVER:
-                    return False
+                self.logger.error(f"  linux-headers installation failed: {err}")
+                return False
             else:
                 self.logger.info("  linux-headers installed.")
 
