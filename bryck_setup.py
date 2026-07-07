@@ -2057,56 +2057,36 @@ class ConfigureNFSExport(SetupTask):
             return False
 
 
-class PostDeployDesktopAndNetwork(SetupTask):
+class ConfigureNetworkManagerInterfaces(SetupTask):
     """
-    Task: Post-deployment desktop environment and network configuration.
+    Task: Configure NetworkManager interfaces — runs independently of bryck build.
 
-    - Installs xfce4 desktop and xrdp
-    - Disables netfilter-persistent and openibd
-    - Configures oob_net0 interface
-    - Disables Mellanox keyfile in NetworkManager
-    - Switches from systemd-networkd to NetworkManager
+    - Configures oob_net0 (managed, autoconnect, connect, reapply)
+    - Writes 40-mlnx.conf (disables Mellanox keyfile)
+    - Configures NetworkManager.conf (dns=none, ifupdown managed=true)
+    - Disables systemd-networkd, switches to NetworkManager
     - Purges netplan
-    - Renames netplan-oob_net0 to oob_net0, adds p0/p1 interfaces
-    - Installs pyroute2==0.7.12 in bryck venv
+    - Renames netplan-oob_net0 -> oob_net0 via nmcli
+    - Adds p0 and p1 ethernet connections via nmcli
     - Disables cloud network config
     - Disables default route on tmfifo_net0
     """
 
-    name = "Post-Deploy Desktop & Network Config"
+    name = "Configure NetworkManager Interfaces"
 
     MLNX_CONF_CONTENT = "[keyfile]\n#unmanaged-devices+=driver:mlx5_core;driver:mlx5e_rep;driver:vxlan\n"
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
-        # --- Step 1: Install XFCE4 desktop & XRDP ---
-        self.logger.info("  Installing xfce4 and xfce4-goodies...")
-        exit_code, _, err = self.ssh.run_command(
-            "DEBIAN_FRONTEND=noninteractive apt install -y xfce4 xfce4-goodies", use_sudo=True
-        )
-        if exit_code != 0:
-            self.logger.warning(f"  xfce4 install issue: {err}")
-
-        self.logger.info("  Installing xrdp...")
-        exit_code, _, err = self.ssh.run_command(
-            "DEBIAN_FRONTEND=noninteractive apt install -y xrdp", use_sudo=True
-        )
-        if exit_code != 0:
-            self.logger.warning(f"  xrdp install issue: {err}")
-
-        # --- Step 2: Disable netfilter-persistent and openibd ---
-        self.logger.info("  Disabling netfilter-persistent and openibd...")
-        self.ssh.run_command("systemctl disable netfilter-persistent openibd", use_sudo=True)
-
-        # --- Step 3: Configure oob_net0 ---
+        # --- Step 1: Configure oob_net0 ---
         self.logger.info("  Configuring oob_net0 interface...")
-        self.ssh.run_command("nmcli device set oob_net0 managed yes", use_sudo=True)
-        self.ssh.run_command("nmcli connection modify oob_net0 autoconnect yes", use_sudo=True)
-        self.ssh.run_command("nmcli device connect oob_net0", use_sudo=True)
-        self.ssh.run_command("nmcli device reapply oob_net0", use_sudo=True)
+        self.ssh.run_command("nmcli device set oob_net0 managed yes 2>/dev/null || true", use_sudo=True)
+        self.ssh.run_command("nmcli connection modify oob_net0 autoconnect yes 2>/dev/null || true", use_sudo=True)
+        self.ssh.run_command("nmcli device connect oob_net0 2>/dev/null || true", use_sudo=True)
+        self.ssh.run_command("nmcli device reapply oob_net0 2>/dev/null || true", use_sudo=True)
 
-        # --- Step 4: Write /etc/NetworkManager/conf.d/40-mlnx.conf ---
+        # --- Step 2: Write /etc/NetworkManager/conf.d/40-mlnx.conf ---
         self.logger.info("  Writing /etc/NetworkManager/conf.d/40-mlnx.conf...")
         try:
             sftp = self.ssh.client.open_sftp()
@@ -2118,15 +2098,15 @@ class PostDeployDesktopAndNetwork(SetupTask):
             return False
 
         self.ssh.run_command(
-            "mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf", use_sudo=True
+            "mkdir -p /etc/NetworkManager/conf.d && mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf",
+            use_sudo=True,
         )
 
-        # --- Step 5: Ensure [ifupdown] managed=true and dns=none in NetworkManager.conf ---
+        # --- Step 3: Configure NetworkManager.conf ---
         self.logger.info("  Configuring /etc/NetworkManager/NetworkManager.conf...")
         nm_conf = "/etc/NetworkManager/NetworkManager.conf"
-        exit_code, nm_content, _ = self.ssh.run_command(f"cat {nm_conf}", use_sudo=True)
+        exit_code, nm_content, _ = self.ssh.run_command(f"cat {nm_conf} 2>/dev/null || echo ''")
 
-        # Ensure [main] dns=none so NM doesn't overwrite /etc/resolv.conf
         if "dns=none" not in nm_content:
             if "[main]" in nm_content:
                 self.ssh.run_command(
@@ -2136,13 +2116,12 @@ class PostDeployDesktopAndNetwork(SetupTask):
                 self.ssh.run_command(
                     f"printf '\\n[main]\\ndns=none\\n' >> {nm_conf}", use_sudo=True
                 )
-            self.logger.info("  [main] dns=none added (prevents NM from overwriting resolv.conf).")
+            self.logger.info("  [main] dns=none added.")
         else:
             self.logger.info("  dns=none already present.")
 
-        # Ensure [ifupdown] managed=true
         if "[ifupdown]" in nm_content and "managed=true" in nm_content:
-            self.logger.info("  [ifupdown] managed=true already present. Skipping.")
+            self.logger.info("  [ifupdown] managed=true already present.")
         else:
             if "[ifupdown]" in nm_content:
                 self.ssh.run_command(
@@ -2154,37 +2133,36 @@ class PostDeployDesktopAndNetwork(SetupTask):
                 )
             self.logger.info("  [ifupdown] managed=true configured.")
 
-        # --- Step 6: Reload NM, disable systemd-networkd, restart NM ---
+        # --- Step 4: Reload NM, disable systemd-networkd, restart NM ---
         self.logger.info("  Reloading NetworkManager...")
         self.ssh.run_command("systemctl reload NetworkManager.service", use_sudo=True)
 
-        self.logger.info("  Disabling systemd-networkd and switching to NetworkManager...")
+        self.logger.info("  Disabling systemd-networkd, switching to NetworkManager...")
         self.ssh.run_command(
-            "systemctl disable --now systemd-networkd.service systemd-networkd.socket networkd-dispatcher.service",
+            "systemctl disable --now systemd-networkd.service systemd-networkd.socket networkd-dispatcher.service 2>/dev/null || true",
             use_sudo=True,
         )
         self.ssh.run_command("systemctl restart NetworkManager", use_sudo=True)
 
-        # --- Step 7: Purge netplan ---
+        # --- Step 5: Purge netplan ---
         self.logger.info("  Purging netplan...")
         self.ssh.run_command(
-            "DEBIAN_FRONTEND=noninteractive apt purge -y netplan netplan.io", use_sudo=True
+            "DEBIAN_FRONTEND=noninteractive apt purge -y netplan netplan.io 2>/dev/null || true",
+            use_sudo=True,
         )
 
-        # --- Step 8: Rename interface and add p0/p1 (using nmcli instead of nmtui) ---
-        self.logger.info("  Renaming netplan-oob_net0 to oob_net0...")
-        # Check if netplan-oob_net0 connection exists
-        exit_code, connections, _ = self.ssh.run_command("nmcli -t -f NAME connection show")
+        # --- Step 6: Rename netplan-oob_net0 -> oob_net0, add p0/p1 ---
+        self.logger.info("  Checking NM connections...")
+        exit_code, connections, _ = self.ssh.run_command("nmcli -t -f NAME connection show 2>/dev/null || echo ''")
+
         if "netplan-oob_net0" in connections:
             self.ssh.run_command(
                 'nmcli connection modify "netplan-oob_net0" con-name "oob_net0"', use_sudo=True
             )
             self.logger.info("  Renamed netplan-oob_net0 -> oob_net0.")
         else:
-            self.logger.info("  netplan-oob_net0 not found (may already be renamed). Skipping.")
+            self.logger.info("  netplan-oob_net0 not found (already renamed or not yet created). Skipping.")
 
-        # Add p0 interface
-        self.logger.info("  Adding p0 interface...")
         if "p0" not in connections:
             self.ssh.run_command(
                 "nmcli connection add type ethernet con-name p0 ifname p0 autoconnect yes",
@@ -2194,8 +2172,6 @@ class PostDeployDesktopAndNetwork(SetupTask):
         else:
             self.logger.info("  p0 already exists. Skipping.")
 
-        # Add p1 interface
-        self.logger.info("  Adding p1 interface...")
         if "p1" not in connections:
             self.ssh.run_command(
                 "nmcli connection add type ethernet con-name p1 ifname p1 autoconnect yes",
@@ -2205,75 +2181,105 @@ class PostDeployDesktopAndNetwork(SetupTask):
         else:
             self.logger.info("  p1 already exists. Skipping.")
 
-        # Reload after changes
         self.ssh.run_command("systemctl reload NetworkManager", use_sudo=True)
 
-        # --- Step 9: Install pyroute2==0.7.12, boto3, netifaces in bryck venv ---
-        self.logger.info("  Installing pyroute2==0.7.12 in bryck venv...")
-        exit_code, _, err = self.ssh.run_command(
-            "/opt/bryck/.venv/bryck/bin/pip3 install pyroute2==0.7.12", use_sudo=True
-        )
-        if exit_code != 0:
-            self.logger.warning(f"  pyroute2 venv install issue: {err}")
-        else:
-            self.logger.info("  pyroute2==0.7.12 installed in venv.")
-
-        self.logger.info("  Installing boto3 in bryck venv...")
-        exit_code, _, err = self.ssh.run_command(
-            "/opt/bryck/.venv/bryck/bin/pip3 install boto3", use_sudo=True
-        )
-        if exit_code != 0:
-            self.logger.warning(f"  boto3 venv install issue: {err}")
-        else:
-            self.logger.info("  boto3 installed in venv.")
-
-        self.logger.info("  Installing netifaces in bryck venv...")
-        exit_code, _, err = self.ssh.run_command(
-            "/opt/bryck/.venv/bryck/bin/pip3 install netifaces", use_sudo=True
-        )
-        if exit_code != 0:
-            self.logger.warning(f"  netifaces venv install issue: {err}")
-        else:
-            self.logger.info("  netifaces installed in venv.")
-
-        # --- Step 10: Disable cloud network config ---
+        # --- Step 7: Disable cloud network config ---
         self.logger.info("  Disabling cloud network config...")
-        try:
-            sftp = self.ssh.client.open_sftp()
-            with sftp.file("/tmp/99-disable-network-config.cfg", "w") as f:
-                f.write("{config: disabled}\n")
-            sftp.close()
-        except Exception as e:
-            self.logger.error(f"  SFTP write failed: {e}")
-            return False
-
-        self.ssh.run_command(
-            "mkdir -p /etc/cloud/cloud.cfg.d", use_sudo=True
+        self.ssh.run_command("mkdir -p /etc/cloud/cloud.cfg.d", use_sudo=True)
+        exit_code, _, _ = self.ssh.run_command(
+            "test -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
         )
-        self.ssh.run_command(
-            "mv /tmp/99-disable-network-config.cfg /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
-            use_sudo=True,
-        )
-        self.logger.info("  Cloud network config disabled.")
+        if exit_code != 0:
+            try:
+                sftp = self.ssh.client.open_sftp()
+                with sftp.file("/tmp/99-disable-network-config.cfg", "w") as f:
+                    f.write("{config: disabled}\n")
+                sftp.close()
+            except Exception as e:
+                self.logger.warning(f"  SFTP write for cloud config failed: {e}")
+            else:
+                self.ssh.run_command(
+                    "mv /tmp/99-disable-network-config.cfg /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
+                    use_sudo=True,
+                )
+                self.logger.info("  Cloud network config disabled.")
+        else:
+            self.logger.info("  Cloud network config already disabled. Skipping.")
 
-        # --- Step 11: Disable default route on tmfifo_net0 ---
+        # --- Step 8: Disable default route on tmfifo_net0 ---
         self.logger.info("  Disabling default route on tmfifo_net0...")
         tmfifo_file = "/etc/NetworkManager/system-connections/tmfifo_net0.nmconnection"
         exit_code, _, _ = self.ssh.run_command(f"test -f {tmfifo_file}")
         if exit_code == 0:
-            # Comment out dns and route1 lines
-            self.ssh.run_command(
-                f"sed -i 's/^dns=/#dns=/' {tmfifo_file}", use_sudo=True
-            )
-            self.ssh.run_command(
-                f"sed -i 's/^route1=/#route1=/' {tmfifo_file}", use_sudo=True
-            )
+            self.ssh.run_command(f"sed -i 's/^dns=/#dns=/' {tmfifo_file}", use_sudo=True)
+            self.ssh.run_command(f"sed -i 's/^route1=/#route1=/' {tmfifo_file}", use_sudo=True)
             self.ssh.run_command("systemctl reload NetworkManager", use_sudo=True)
             self.logger.info("  tmfifo_net0 default route disabled.")
         else:
             self.logger.info(f"  {tmfifo_file} not found. Skipping.")
 
-        self.logger.info("  Post-deploy desktop & network config completed.")
+        self.logger.info("  NetworkManager interfaces configured successfully.")
+        return True
+
+
+class PostDeployVenvPackages(SetupTask):
+    """
+    Task: Post-deployment bryck-specific packages (requires bryck build installed).
+
+    - Installs xfce4 desktop and xrdp
+    - Disables netfilter-persistent and openibd
+    - Installs pyroute2==0.7.12, boto3, netifaces into bryck venv
+    """
+
+    name = "Post-Deploy Venv Packages & Desktop"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # --- Step 1: Install XFCE4 desktop & XRDP ---
+        self.logger.info("  Installing xfce4 and xfce4-goodies...")
+        exit_code, _, err = self.ssh.run_command(
+            "DEBIAN_FRONTEND=noninteractive apt install -y xfce4 xfce4-goodies", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.warning(f"  xfce4 install issue: {err}")
+        else:
+            self.logger.info("  xfce4 installed.")
+
+        self.logger.info("  Installing xrdp...")
+        exit_code, _, err = self.ssh.run_command(
+            "DEBIAN_FRONTEND=noninteractive apt install -y xrdp", use_sudo=True
+        )
+        if exit_code != 0:
+            self.logger.warning(f"  xrdp install issue: {err}")
+        else:
+            self.logger.info("  xrdp installed.")
+
+        # --- Step 2: Disable netfilter-persistent and openibd ---
+        self.logger.info("  Disabling netfilter-persistent and openibd...")
+        self.ssh.run_command(
+            "systemctl disable netfilter-persistent openibd 2>/dev/null || true", use_sudo=True
+        )
+
+        # --- Step 3: Install pip packages in bryck venv ---
+        venv_pip = "/opt/bryck/.venv/bryck/bin/pip3"
+        exit_code, _, _ = self.ssh.run_command(f"test -f {venv_pip}")
+        if exit_code != 0:
+            self.logger.warning(f"  bryck venv not found at {venv_pip}. Skipping venv installs.")
+            return True
+
+        for pkg, version in [("pyroute2", "0.7.12"), ("boto3", None), ("netifaces", None)]:
+            pkg_spec = f"{pkg}=={version}" if version else pkg
+            self.logger.info(f"  Installing {pkg_spec} in bryck venv...")
+            exit_code, _, err = self.ssh.run_command(
+                f"{venv_pip} install {pkg_spec}", use_sudo=True
+            )
+            if exit_code != 0:
+                self.logger.warning(f"  {pkg_spec} install issue: {err}")
+            else:
+                self.logger.info(f"  {pkg_spec} installed.")
+
+        self.logger.info("  Post-deploy venv packages installed successfully.")
         return True
 
 
@@ -2718,9 +2724,11 @@ TASK_REGISTRY: list[type[SetupTask]] = [
     InstallPackagesAndSDKs,
     FlushIPTables,
     ConfigureNetworkManagerAndSSL,
+    ConfigureNetworkManagerInterfaces,   # NM config — independent of build
     DeployBryckBuild,
+    FixConfigJsonPermissions,
     ConfigureNFSExport,
-    PostDeployDesktopAndNetwork,
+    PostDeployVenvPackages,              # bryck venv + desktop — requires build
     DownloadBryckCLIAndNFSDPatch,
     ApplyNFSDPatchAndRemoveSamba,
     InstallBryckCLI,
@@ -3109,7 +3117,24 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   su - bryck -c 'sshpass -p ... ssh-copy-id bryck@localhost'")
     print()
 
-    # --- Task 13: Deploy Bryck Build ---
+    # --- Configure NetworkManager Interfaces (build-independent) ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Configure NetworkManager Interfaces")
+    print(f"{'─'*70}")
+    print(f"  [SUDO]   nmcli device set oob_net0 managed yes")
+    print(f"  [SUDO]   nmcli connection modify oob_net0 autoconnect yes")
+    print(f"  [SUDO]   nmcli device connect / reapply oob_net0")
+    print(f"  [SFTP]   Write /etc/NetworkManager/conf.d/40-mlnx.conf (disable Mellanox keyfile)")
+    print(f"  [SUDO]   Configure NetworkManager.conf (dns=none, ifupdown managed=true)")
+    print(f"  [SUDO]   systemctl reload/restart NetworkManager; disable systemd-networkd")
+    print(f"  [SUDO]   apt purge netplan netplan.io")
+    print(f"  [SUDO]   nmcli: rename netplan-oob_net0 -> oob_net0; add p0/p1 connections")
+    print(f"  [SFTP]   Write /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg")
+    print(f"  [SUDO]   Disable dns/route1 in tmfifo_net0.nmconnection")
+    print()
+
+    # --- Task: Deploy Bryck Build ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Deploy Bryck Build")
@@ -3146,7 +3171,7 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [VERIFY] stat -c '%U %G %a' /etc/bryck/bryckutil/config.json")
     print()
 
-    # --- Task 15: Configure NFS Export ---
+    # --- Task: Configure NFS Export ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Configure NFS Export (anonuid/anongid)")
@@ -3160,39 +3185,17 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [VERIFY] cat /opt/ansible/roles/add-export/vars/main.yml")
     print()
 
-    # --- Task 15: Post-Deploy Desktop & Network ---
+    # --- Task: Post-Deploy Venv Packages & Desktop ---
     task_num += 1
     print(f"{'─'*70}")
-    print(f"  TASK {task_num}: Post-Deploy Desktop & Network Config")
+    print(f"  TASK {task_num}: Post-Deploy Venv Packages & Desktop")
     print(f"{'─'*70}")
     print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y xfce4 xfce4-goodies")
     print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y xrdp")
     print(f"  [SUDO]   systemctl disable netfilter-persistent openibd")
-    print(f"  [SUDO]   nmcli device set oob_net0 managed yes")
-    print(f"  [SUDO]   nmcli connection modify oob_net0 autoconnect yes")
-    print(f"  [SUDO]   nmcli device connect oob_net0")
-    print(f"  [SUDO]   nmcli device reapply oob_net0")
-    print(f"  [SFTP]   Write /tmp/40-mlnx.conf:")
-    print(f"             [keyfile]")
-    print(f"             #unmanaged-devices+=driver:mlx5_core;driver:mlx5e_rep;driver:vxlan")
-    print(f"  [SUDO]   mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf")
-    print(f"  [SUDO]   systemctl reload NetworkManager.service")
-    print(f"  [SUDO]   systemctl disable --now systemd-networkd.service systemd-networkd.socket networkd-dispatcher.service")
-    print(f"  [SUDO]   systemctl restart NetworkManager")
-    print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt purge -y netplan netplan.io")
-    print(f"  [SUDO]   nmcli connection modify 'netplan-oob_net0' con-name 'oob_net0'")
-    print(f"  [SUDO]   nmcli connection add type ethernet con-name p0 ifname p0 autoconnect yes")
-    print(f"  [SUDO]   nmcli connection add type ethernet con-name p1 ifname p1 autoconnect yes")
-    print(f"  [SUDO]   systemctl reload NetworkManager")
     print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install pyroute2==0.7.12")
     print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install boto3")
     print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install netifaces")
-    print(f"  [SFTP]   Write /tmp/99-disable-network-config.cfg: {{config: disabled}}")
-    print(f"  [SUDO]   mkdir -p /etc/cloud/cloud.cfg.d")
-    print(f"  [SUDO]   mv /tmp/99-disable-network-config.cfg /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg")
-    print(f"  [SUDO]   sed -i 's/^dns=/#dns=/' /etc/NetworkManager/system-connections/tmfifo_net0.nmconnection")
-    print(f"  [SUDO]   sed -i 's/^route1=/#route1=/' /etc/NetworkManager/system-connections/tmfifo_net0.nmconnection")
-    print(f"  [SUDO]   systemctl reload NetworkManager")
     print()
 
     # --- Task 16: Download BryckCLI & NFSD Patch ---
