@@ -1190,7 +1190,25 @@ class InstallPackagesAndSDKs(SetupTask):
         else:
             self.logger.info("  /etc/rc.local already has 'exit 0'. Skipping.")
 
-        # Step 5: Add Google Cloud SDK repository
+        self.logger.info("  Base packages configured successfully.")
+        return True
+
+
+class InstallCloudCLIs(SetupTask):
+    """
+    Task: Install cloud provider CLIs (Google Cloud, Azure, AWS).
+
+    Runs unconditionally after the Bryck build is deployed so the CLIs are
+    available to bryckutil KMS operations.  Each sub-step is non-fatal so a
+    single vendor failure does not abort the others.
+    """
+
+    name = "Install Cloud CLIs (Google / Azure / AWS)"
+
+    def run(self) -> bool:
+        self.logger.info(f"[TASK] {self.name}")
+
+        # Step 1: Add Google Cloud SDK repository
         self.logger.info("  Adding Google Cloud SDK repository...")
         exit_code, _, _ = self.ssh.run_command(
             "test -f /usr/share/keyrings/cloud.google.gpg"
@@ -1228,7 +1246,7 @@ class InstallPackagesAndSDKs(SetupTask):
             else:
                 self.logger.info("  google-cloud-cli installed.")
 
-        # Step 6: Install crcmod
+        # Step 2: Install crcmod (required by gsutil)
         self.logger.info("  Installing crcmod...")
         exit_code, _, err = self.ssh.run_command(
             "pip3 install --no-cache-dir -U crcmod", use_sudo=True
@@ -1238,7 +1256,7 @@ class InstallPackagesAndSDKs(SetupTask):
         else:
             self.logger.info("  crcmod installed.")
 
-        # Step 7: Add Azure CLI repository
+        # Step 3: Add Azure CLI repository
         self.logger.info("  Adding Azure CLI repository...")
         exit_code, _, _ = self.ssh.run_command(
             "test -f /usr/share/keyrings/microsoft.gpg"
@@ -1280,7 +1298,7 @@ class InstallPackagesAndSDKs(SetupTask):
             else:
                 self.logger.info("  azure-cli installed.")
 
-        # Step 8: Install AWS CLI v2
+        # Step 4: Install AWS CLI v2
         self.logger.info("  Installing AWS CLI v2...")
         exit_code, _, _ = self.ssh.run_command("/usr/local/bin/aws --version 2>/dev/null")
         if exit_code == 0:
@@ -1313,7 +1331,7 @@ class InstallPackagesAndSDKs(SetupTask):
                         self.logger.info(f"  AWS CLI installed: {ver_out}")
                 self.ssh.run_command("rm -rf /tmp/awscliv2.zip /tmp/aws", use_sudo=True)
 
-        self.logger.info("  All packages and SDK repos configured successfully.")
+        self.logger.info("  Cloud CLIs configured successfully.")
         return True
 
 
@@ -1321,34 +1339,18 @@ class FlushIPTables(SetupTask):
     """
     Task: Reset iptables/ip6tables to allow-all and save clean rules.
 
-    This clears all firewall rules so the device starts with a clean network
-    state. Sets all chain policies to ACCEPT, flushes all tables (nat, mangle,
-    filter), deletes user-defined chains, and saves the result to
-    /etc/iptables/rules.v4.
+    Runs all iptables/ip6tables reset commands in a single shell block (matching
+    the reference setup doc).  An overall timeout of BLOCK_TIMEOUT seconds guards
+    against the block hanging — if it does, the hang is reported clearly and the
+    task continues (best-effort).
     """
 
     name = "Flush IPTables (Network Setup)"
 
-    # iptables on the BlueField DPU can block indefinitely waiting on the
-    # xtables lock or a slow netfilter backend. '-w LOCK_WAIT' bounds the lock
-    # wait, and a server-side 'timeout CMD_TIMEOUT' guarantees the process is
-    # killed instead of hanging the SSH session.
-    LOCK_WAIT = 5     # seconds iptables waits for the xtables lock (-w)
-    CMD_TIMEOUT = 15  # seconds before the remote iptables call is killed
-
-    def _run_reset(self, tool: str, args: str) -> bool:
-        """Run a single iptables/ip6tables reset command; never fatal, never hangs."""
-        cmd = f"timeout {self.CMD_TIMEOUT} {tool} -w {self.LOCK_WAIT} {args}"
-        exit_code, _, err = self.ssh.run_command(
-            cmd, use_sudo=True, timeout=self.CMD_TIMEOUT + 10
-        )
-        if exit_code == 0:
-            return True
-        if exit_code == 124:
-            self.logger.warning(f"  Non-fatal: '{tool} {args}' timed out (continuing).")
-        else:
-            self.logger.warning(f"  Non-fatal: '{tool} {args}' -> exit {exit_code} {err} (continuing).")
-        return False
+    # Overall timeout (seconds) for the entire iptables reset block.
+    # If the block does not finish within this window the device has likely
+    # locked up on the xtables lock and the hang is reported.
+    BLOCK_TIMEOUT = 60
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
@@ -1357,34 +1359,51 @@ class FlushIPTables(SetupTask):
         self.logger.info("  Removing existing /etc/iptables/rules.*...")
         self.ssh.run_command("rm -f /etc/iptables/rules.*", use_sudo=True)
 
-        # Reset args, applied to both iptables (IPv4) and ip6tables (IPv6).
-        reset_args = [
-            "-P INPUT ACCEPT",
-            "-P FORWARD ACCEPT",
-            "-P OUTPUT ACCEPT",
-            "-t nat -F",
-            "-t mangle -F",
-            "-F",
-            "-X",
-        ]
+        # Step 2: Run the full iptables + ip6tables reset in one shell block
+        self.logger.info("  Running iptables/ip6tables reset block...")
+        flush_script = (
+            "iptables -P INPUT ACCEPT && "
+            "iptables -P FORWARD ACCEPT && "
+            "iptables -P OUTPUT ACCEPT && "
+            "iptables -t nat -F && "
+            "iptables -t mangle -F && "
+            "iptables -F && "
+            "iptables -X && "
+            "ip6tables -P INPUT ACCEPT && "
+            "ip6tables -P FORWARD ACCEPT && "
+            "ip6tables -P OUTPUT ACCEPT && "
+            "ip6tables -t nat -F && "
+            "ip6tables -t mangle -F && "
+            "ip6tables -F && "
+            "ip6tables -X"
+        )
+        exit_code, _, err = self.ssh.run_command(
+            f"timeout {self.BLOCK_TIMEOUT} bash -c '{flush_script}'",
+            use_sudo=True,
+            timeout=self.BLOCK_TIMEOUT + 10,
+        )
+        if exit_code == 124:
+            self.logger.error(
+                f"  HUNG: iptables reset block did not complete within {self.BLOCK_TIMEOUT}s. "
+                "The device appears to have locked on the xtables lock. "
+                "Manual intervention may be required (reboot or 'modprobe -r iptable_filter')."
+            )
+            flush_ok = False
+        elif exit_code != 0:
+            self.logger.warning(f"  iptables reset block exited with code {exit_code}: {err}")
+            flush_ok = False
+        else:
+            self.logger.info("  iptables/ip6tables reset block completed.")
+            flush_ok = True
 
-        # Step 2: Flush IPv4 iptables (best-effort — individual failures are non-fatal)
-        self.logger.info("  Resetting IPv4 iptables to ACCEPT all...")
-        ipv4_ok = all([self._run_reset("iptables", a) for a in reset_args])
-
-        # Step 3: Flush IPv6 ip6tables
-        self.logger.info("  Resetting IPv6 ip6tables to ACCEPT all...")
-        ipv6_ok = all([self._run_reset("ip6tables", a) for a in reset_args])
-
-        # Step 4: Ensure /etc/iptables directory exists
+        # Step 3: Ensure /etc/iptables directory exists
         self.ssh.run_command("mkdir -p /etc/iptables", use_sudo=True)
 
-        # Step 5: Save clean rules
+        # Step 4: Save clean rules
         self.logger.info("  Saving clean rules to /etc/iptables/rules.v4...")
         exit_code, _, err = self.ssh.run_command(
-            f"bash -c 'timeout {self.CMD_TIMEOUT} iptables-save > /etc/iptables/rules.v4'",
+            "bash -c 'iptables-save > /etc/iptables/rules.v4'",
             use_sudo=True,
-            timeout=self.CMD_TIMEOUT + 10,
         )
         save_ok = exit_code == 0
         if save_ok:
@@ -1395,7 +1414,7 @@ class FlushIPTables(SetupTask):
         else:
             self.logger.warning(f"  Could not save iptables rules: {err}")
 
-        if ipv4_ok and ipv6_ok and save_ok:
+        if flush_ok and save_ok:
             self.logger.info("  IPTables flushed and saved successfully.")
         else:
             self.logger.warning(
@@ -2856,6 +2875,7 @@ TASK_REGISTRY: list[type[SetupTask]] = [
     ConfigureNetworkManagerAndSSL,
     ConfigureNetworkManagerInterfaces,   # NM config — independent of build
     DeployBryckBuild,
+    InstallCloudCLIs,                    # cloud CLIs — always runs, after build
     FixConfigJsonPermissions,
     ConfigureNFSExport,
     PostDeployVenvPackages,              # bryck venv + desktop — requires build
