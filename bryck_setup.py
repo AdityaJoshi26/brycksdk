@@ -1128,7 +1128,7 @@ class InstallPackagesAndSDKs(SetupTask):
         "rclone", "curl", "jq", "sysbench",
     ]
 
-    PIP_PACKAGES = ["ansible", "pyroute2", "boto3", "netifaces"]
+    PIP_PACKAGES = ["ansible", "pyroute2" ]
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
@@ -1196,14 +1196,14 @@ class InstallPackagesAndSDKs(SetupTask):
 
 class InstallCloudCLIs(SetupTask):
     """
-    Task: Install cloud provider CLIs (Google Cloud, Azure, AWS).
+    Task: Install cloud provider CLIs (Google Cloud, Azure).
 
     Runs unconditionally after the Bryck build is deployed so the CLIs are
     available to bryckutil KMS operations.  Each sub-step is non-fatal so a
     single vendor failure does not abort the others.
     """
 
-    name = "Install Cloud CLIs (Google / Azure / AWS)"
+    name = "Install Cloud CLIs (Google / Azure)"
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
@@ -1297,39 +1297,6 @@ class InstallCloudCLIs(SetupTask):
                 self.logger.warning(f"  azure-cli install failed: {err}")
             else:
                 self.logger.info("  azure-cli installed.")
-
-        # Step 4: Install AWS CLI v2
-        self.logger.info("  Installing AWS CLI v2...")
-        exit_code, _, _ = self.ssh.run_command("/usr/local/bin/aws --version 2>/dev/null")
-        if exit_code == 0:
-            self.logger.info("  AWS CLI v2 already installed. Skipping.")
-        else:
-            if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
-                aws_url = "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"
-            else:
-                aws_url = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
-            self.logger.info(f"  Downloading AWS CLI from {aws_url}...")
-            exit_code, _, err = self.ssh.run_command(
-                f"curl -fsSL {aws_url} -o /tmp/awscliv2.zip", use_sudo=True
-            )
-            if exit_code != 0:
-                self.logger.warning(f"  AWS CLI download failed: {err}")
-            else:
-                exit_code, _, err = self.ssh.run_command(
-                    "unzip -o /tmp/awscliv2.zip -d /tmp/", use_sudo=True
-                )
-                if exit_code != 0:
-                    self.logger.warning(f"  AWS CLI unzip failed: {err}")
-                else:
-                    exit_code, _, err = self.ssh.run_command(
-                        "/tmp/aws/install --update", use_sudo=True
-                    )
-                    if exit_code != 0:
-                        self.logger.warning(f"  AWS CLI install failed: {err}")
-                    else:
-                        exit_code, ver_out, _ = self.ssh.run_command("aws --version")
-                        self.logger.info(f"  AWS CLI installed: {ver_out}")
-                self.ssh.run_command("rm -rf /tmp/awscliv2.zip /tmp/aws", use_sudo=True)
 
         self.logger.info("  Cloud CLIs configured successfully.")
         return True
@@ -2377,7 +2344,7 @@ class PostDeployVenvPackages(SetupTask):
 
     - Installs xfce4 desktop and xrdp
     - Disables netfilter-persistent and openibd
-    - Installs pyroute2==0.7.12, boto3, netifaces into bryck venv
+    - Installs pyroute2==0.7.12, netifaces into bryck venv
     """
 
     name = "Post-Deploy Venv Packages & Desktop"
@@ -2417,7 +2384,7 @@ class PostDeployVenvPackages(SetupTask):
             self.logger.warning(f"  bryck venv not found at {venv_pip}. Skipping venv installs.")
             return True
 
-        for pkg, version in [("pyroute2", "0.7.12"), ("boto3", None), ("netifaces", None)]:
+        for pkg, version in [("pyroute2", "0.7.12"), ("netifaces", None)]:
             pkg_spec = f"{pkg}=={version}" if version else pkg
             self.logger.info(f"  Installing {pkg_spec} in bryck venv...")
             exit_code, _, err = self.ssh.run_command(
@@ -3217,7 +3184,6 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"             rclone curl jq sysbench")
     print(f"  [SUDO]   pip3 install ansible")
     print(f"  [SUDO]   pip3 install pyroute2")
-    print(f"  [SUDO]   pip3 install boto3")
     print(f"  [SUDO]   pip3 install netifaces")
     print(f"  [SUDO]   chmod +x /etc/rc.local")
     print(f"  [SUDO]   curl + gpg -> /usr/share/keyrings/cloud.google.gpg")
@@ -3227,11 +3193,6 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   curl + gpg -> /usr/share/keyrings/microsoft.gpg")
     print(f"  [SUDO]   Add Azure CLI apt source")
     print(f"  [SUDO]   apt-get update && apt-get install -y azure-cli")
-    aws_arch = 'aarch64' if config.bryck_type == BryckType.BRYCKMINI else 'x86_64'
-    print(f"  [SUDO]   curl awscli-exe-linux-{aws_arch}.zip -o /tmp/awscliv2.zip")
-    print(f"  [SUDO]   unzip /tmp/awscliv2.zip -d /tmp/")
-    print(f"  [SUDO]   /tmp/aws/install --update")
-    print(f"  [SUDO]   rm -rf /tmp/awscliv2.zip /tmp/aws")
     print()
 
     # --- Task 11: Flush IPTables ---
@@ -3344,7 +3305,6 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   DEBIAN_FRONTEND=noninteractive apt install -y xrdp")
     print(f"  [SUDO]   systemctl disable netfilter-persistent openibd")
     print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install pyroute2==0.7.12")
-    print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install boto3")
     print(f"  [SUDO]   /opt/bryck/.venv/bryck/bin/pip3 install netifaces")
     print()
 
