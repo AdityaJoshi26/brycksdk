@@ -60,7 +60,33 @@ class DeviceConfig:
     bryck_type: BryckType | None = None  # Auto-detected after SSH
     ssh_port: int = 22
     timeout: int = 30
+    # Budget for slow package/download/deploy commands (apt, pip, wget, tar,
+    # scp, update-grub, ...). The 30s default is only meant for quick shell
+    # commands; anything that touches the network or dpkg needs far longer or
+    # it gets wrongly abandoned mid-install.
+    long_timeout: int = 1800  # 30 minutes
+    # For long-running commands we do NOT abandon on a wall-clock timer: as long
+    # as the command keeps producing output we keep waiting (a kernel/apt install
+    # can legitimately take a long time). We only give up if the command goes
+    # completely silent — no stdout/stderr at all — for this many seconds, which
+    # indicates it is genuinely stuck (e.g. waiting on an interactive prompt).
+    idle_timeout: int = 600  # 10 minutes of total silence => considered hung
     bryck_build: str | None = None  # e.g. "tsecond-bryck-5.0.0.15"
+    skip_reboot: bool = False  # Skip the reboot step (--skip-reboot)
+
+
+# Substrings that mark a command as slow (package management, downloads,
+# archive extraction, boot config, deploy). When a caller does not pass an
+# explicit timeout, any command containing one of these gets config.long_timeout
+# instead of the short config.timeout, so kernel/apt installs are never
+# abandoned mid-flight.
+LONG_RUNNING_MARKERS: tuple[str, ...] = (
+    "apt ", "apt-get", "aptitude", "dpkg", "dist-upgrade", "--fix-broken",
+    "pip install", "pip3 install", "wget", "curl", "update-grub",
+    "tar -x", "tar -c", "tar -z", "tar -t", "gzip", "scp ", "sshpass",
+    "ssh-copy-id", "modprobe", "bryckdeploy", "deploy_bryckcli",
+    "replace_nfsd_module", "openssl req",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +154,12 @@ class SSHConnection:
                 look_for_keys=False,
                 allow_agent=False,
             )
+            # Keep the transport alive during long, quiet installs so the TCP
+            # connection is not dropped by an idle NAT/firewall and a dead peer
+            # is detected promptly.
+            transport = self.client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(30)
             self.logger.info("SSH connection established successfully.")
         except paramiko.AuthenticationException:
             self.logger.error("Authentication failed. Check username/password.")
@@ -168,23 +200,49 @@ class SSHConnection:
             self.logger.error(f"  Reconnect failed: {e}")
             return False
 
+    def _default_timeout(self, command: str) -> int:
+        """
+        Pick a sensible timeout when the caller doesn't specify one.
+
+        Slow operations (apt/dpkg/pip installs, downloads, archive extraction,
+        update-grub, deploy scripts) get config.long_timeout; everything else
+        gets the short config.timeout. This prevents kernel/package installs
+        from being wrongly abandoned after 30s while still failing fast on
+        genuinely hung quick commands.
+        """
+        lowered = command.lower()
+        if any(marker in lowered for marker in LONG_RUNNING_MARKERS):
+            return self.config.long_timeout
+        return self.config.timeout
+
     def run_command(
         self, command: str, use_sudo: bool = False, timeout: int | None = None
     ) -> tuple[int, str, str]:
         """
         Execute a command on the remote device.
 
-        A per-command timeout is enforced explicitly: paramiko's
-        recv_exit_status() is NOT bounded by exec_command(timeout=...), so a
-        hung remote command would otherwise block until the TCP connection
-        dies. We wait on the channel's status_event instead and abandon the
-        command if it overruns, returning exit code 124 (timeout) rather than
-        killing the whole run.
+        Two waiting strategies are used:
+
+        * Long-running commands (package installs, downloads, deploys — see
+          LONG_RUNNING_MARKERS) are waited on by ACTIVITY, not a wall clock.
+          As long as the command keeps producing output we keep waiting, so a
+          kernel/apt install is never abandoned just because it is slow. We
+          only give up if it goes completely silent for config.idle_timeout
+          seconds (a genuine hang, e.g. an interactive prompt).
+
+        * Short commands use a bounded wall-clock timeout so a hung quick
+          command cannot block the pipeline forever.
+
+        An explicit `timeout` argument always wins and is treated as a hard
+        wall-clock cap (used by callers that intentionally bound a command).
 
         Returns:
             Tuple of (exit_code, stdout, stderr)
         """
-        timeout = timeout if timeout is not None else self.config.timeout
+        explicit_timeout = timeout is not None
+        long_running = any(m in command.lower() for m in LONG_RUNNING_MARKERS)
+        if timeout is None:
+            timeout = self._default_timeout(command)
 
         # Heal a dead transport (e.g. after a previous command hung) so this
         # command — and the rest of the pipeline — can still proceed.
@@ -195,24 +253,76 @@ class SSHConnection:
         full_command = f"echo '{self.config.password}' | sudo -S {command}" if use_sudo else command
         self.logger.debug(f"Executing: {command}")
 
-        try:
-            stdin, stdout, stderr = self.client.exec_command(full_command, timeout=timeout)
-            channel = stdout.channel
+        # Activity-based waiting when the command is long-running and the caller
+        # did not force a hard cap: wait as long as output keeps flowing.
+        use_idle_wait = long_running and not explicit_timeout
 
-            # Bounded wait for completion (recv_exit_status ignores the timeout).
-            if not channel.status_event.wait(timeout):
-                self.logger.warning(
-                    f"Command exceeded {timeout}s and was abandoned: {command}"
-                )
+        try:
+            stdin, stdout, stderr = self.client.exec_command(full_command, timeout=None)
+            channel = stdout.channel
+            channel.setblocking(0)
+
+            out_chunks: list[bytes] = []
+            err_chunks: list[bytes] = []
+            start = time.monotonic()
+            last_activity = start
+            abandoned = False
+
+            while True:
+                got_data = False
+                while channel.recv_ready():
+                    data = channel.recv(65536)
+                    if data:
+                        out_chunks.append(data)
+                        got_data = True
+                while channel.recv_stderr_ready():
+                    data = channel.recv_stderr(65536)
+                    if data:
+                        err_chunks.append(data)
+                        got_data = True
+
+                now = time.monotonic()
+                if got_data:
+                    last_activity = now
+
+                # Finished: exit status posted and no buffered output remains.
+                if (
+                    channel.exit_status_ready()
+                    and not channel.recv_ready()
+                    and not channel.recv_stderr_ready()
+                ):
+                    break
+
+                if use_idle_wait:
+                    # Only abandon after a long stretch of TOTAL silence.
+                    if now - last_activity > self.config.idle_timeout:
+                        self.logger.warning(
+                            f"Command produced no output for {self.config.idle_timeout}s "
+                            f"and was abandoned (likely stuck): {command}"
+                        )
+                        abandoned = True
+                        break
+                else:
+                    if now - start > timeout:
+                        self.logger.warning(
+                            f"Command exceeded {timeout}s and was abandoned: {command}"
+                        )
+                        abandoned = True
+                        break
+
+                if not got_data:
+                    time.sleep(0.2)
+
+            if abandoned:
                 try:
                     channel.close()
                 except Exception:
                     pass
-                return 124, "", f"timed out after {timeout}s"
+                return 124, "", f"abandoned after no progress"
 
             exit_code = channel.recv_exit_status()
-            out = stdout.read().decode(errors="replace").strip()
-            err = stderr.read().decode(errors="replace").strip()
+            out = b"".join(out_chunks).decode(errors="replace").strip()
+            err = b"".join(err_chunks).decode(errors="replace").strip()
         except (socket.timeout, paramiko.SSHException, OSError) as e:
             self.logger.warning(f"Command failed on transport ({command}): {e}")
             # Transport is likely dead; drop the client so the next call reconnects.
@@ -252,6 +362,12 @@ class SetupTask:
     """Base class for setup tasks."""
 
     name: str = "Unnamed Task"
+
+    # Foundational tasks whose failure makes every later task pointless
+    # (e.g. creating the bryck user, granting sudo, reconnecting as bryck).
+    # When a critical task fails the runner aborts instead of cascading
+    # dozens of doomed sudo commands.
+    critical: bool = False
 
     def __init__(self, ssh: SSHConnection, logger: logging.Logger):
         self.ssh = ssh
@@ -322,6 +438,7 @@ class CreateUsers(SetupTask):
     """
 
     name = "Create Users (bryck & admin)"
+    critical = True  # everything downstream runs as bryck and needs sudo
 
     USERS = [
         {"username": "bryck", "password": "while(1);"},
@@ -368,6 +485,20 @@ class CreateUsers(SetupTask):
         if not self._create_user("bryck", "while(1);"):
             success = False
 
+        # Step 1b: Grant 'bryck' sudo access via group membership BEFORE any
+        # later task reconnects as bryck. This is the fix for the classic
+        # "bryck is not in the sudoers file" cascade: useradd alone leaves the
+        # user unprivileged, so the very next sudo command (run as bryck) would
+        # fail. Group membership means 'echo <bryck password> | sudo -S ...'
+        # works immediately, even before /etc/sudoers is customised.
+        self.logger.info("  Adding 'bryck' to the 'sudo' group...")
+        exit_code, _, err = self.ssh.run_command("usermod -aG sudo bryck", use_sudo=True)
+        if exit_code != 0:
+            self.logger.error(f"  Failed to add 'bryck' to sudo group: {err}")
+            success = False
+        else:
+            self.logger.info("  'bryck' added to sudo group.")
+
         # Step 2: Delete admin group (if exists) to avoid conflict with admin user
         self.logger.info("  Removing 'admin' group if it exists...")
         exit_code, _, err = self.ssh.run_command("groupdel admin", use_sudo=True)
@@ -407,6 +538,7 @@ class ReconnectAsBryckUser(SetupTask):
 
     BRYCK_USER = "bryck"
     BRYCK_PASSWORD = "while(1);"
+    critical = True  # all later tasks must run natively as bryck
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
@@ -473,6 +605,7 @@ class ConfigureSudoers(SetupTask):
     """
 
     name = "Configure Sudoers (/etc/sudoers)"
+    critical = True  # bryck needs passwordless sudo for the rest of the run
 
     SUDOERS_LINES = [
         "Cmnd_Alias MORE = /usr/sbin/nvme, /usr/bin/lsblk, /usr/bin/journalctl, /usr/sbin/parted, /usr/sbin/partprobe, /usr/bin/xxd, /usr/bin/dd, /opt/ansible/drivers/lsblk, /usr/sbin/sgdisk, /opt/ansible/drivers/cryptsetup, /usr/sbin/zpool, /usr/sbin/zfs, /usr/sbin/sysctl, /usr/bin/systemctl, /usr/bin/chmod, /usr/bin/umount, /usr/bin/mount, /usr/sbin/dmsetup, /usr/sbin/mdadm, /usr/sbin/lsof, /usr/bin/df, /sbin/ethtool, /sbin/blockdev",
@@ -691,6 +824,60 @@ class InstallKernel(SetupTask):
         "vim",
     ]
 
+    # Retry the install a few times: package mirrors and dpkg locks can cause
+    # transient failures that succeed on a second attempt.
+    INSTALL_ATTEMPTS = 3
+
+    def _wait_for_apt_lock(self, max_wait: int = 300) -> None:
+        """Block until no other process holds the dpkg/apt lock (bounded)."""
+        self.logger.info("  Waiting for any running apt/dpkg to release the lock...")
+        wait_cmd = (
+            "for i in $(seq 1 %d); do "
+            "  if fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock "
+            "/var/lib/apt/lists/lock >/dev/null 2>&1; then sleep 2; else exit 0; fi; "
+            "done; exit 0" % (max_wait // 2)
+        )
+        self.ssh.run_command(f"bash -c '{wait_cmd}'", use_sudo=True, timeout=max_wait + 30)
+
+    def _install_kernel_packages(self) -> bool:
+        """Install kernel packages with lock-wait, index refresh, and retries."""
+        packages_str = " ".join(self.KERNEL_PACKAGES)
+
+        for attempt in range(1, self.INSTALL_ATTEMPTS + 1):
+            self.logger.info(
+                f"  Installing kernel packages (attempt {attempt}/{self.INSTALL_ATTEMPTS}): {packages_str}"
+            )
+            self.logger.info("  This may take several minutes...")
+
+            # Make sure no other apt/dpkg run is holding the lock, and repair
+            # any half-configured state left by a previous interrupted run.
+            self._wait_for_apt_lock()
+            self.ssh.run_command("apt-get update", use_sudo=True)
+            self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive dpkg --configure -a", use_sudo=True
+            )
+            self.ssh.run_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y", use_sudo=True
+            )
+
+            exit_code, out, err = self.ssh.run_command(
+                f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {packages_str}",
+                use_sudo=True,
+            )
+            if exit_code == 0:
+                self.logger.info("  Kernel packages installed successfully.")
+                return True
+
+            # A timeout (124) or transient mirror/lock error — retry.
+            self.logger.warning(
+                f"  Kernel install attempt {attempt} failed (exit {exit_code}): {err or out}"
+            )
+
+        self.logger.error(
+            f"  Kernel installation failed after {self.INSTALL_ATTEMPTS} attempts."
+        )
+        return False
+
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
@@ -702,17 +889,9 @@ class InstallKernel(SetupTask):
         if exit_code == 0:
             self.logger.info(f"  Kernel {self.KERNEL_VERSION} already installed.")
         else:
-            # Step 2: Install kernel packages
-            packages_str = " ".join(self.KERNEL_PACKAGES)
-            self.logger.info(f"  Installing kernel packages: {packages_str}")
-            self.logger.info("  This may take several minutes...")
-            exit_code, out, err = self.ssh.run_command(
-                f"DEBIAN_FRONTEND=noninteractive apt install -y {packages_str}", use_sudo=True
-            )
-            if exit_code != 0:
-                self.logger.error(f"  Kernel installation failed: {err}")
+            # Step 2: Install kernel packages (with lock-wait + retries)
+            if not self._install_kernel_packages():
                 return False
-            self.logger.info("  Kernel packages installed successfully.")
 
         # Step 3: Check if GRUB is already configured for this kernel
         self.logger.info("  Checking current GRUB_DEFAULT...")
@@ -954,39 +1133,43 @@ class RebootAndInstallPostKernel(SetupTask):
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
-        # Step 1: Initiate reboot
-        self.logger.info("  Initiating reboot (kernel was changed)...")
-        # Use nohup and background to avoid the SSH channel closing mid-command
-        self.ssh.run_command("nohup bash -c 'sleep 2 && reboot' &", use_sudo=True)
-        self.logger.info("  Reboot command sent.")
+        if self.ssh.config.skip_reboot:
+            self.logger.info("  --skip-reboot set: skipping reboot and kernel verification.")
+            self.logger.info("  Installing post-kernel packages against the currently running kernel.")
+        else:
+            # Step 1: Initiate reboot
+            self.logger.info("  Initiating reboot (kernel was changed)...")
+            # Use nohup and background to avoid the SSH channel closing mid-command
+            self.ssh.run_command("nohup bash -c 'sleep 2 && reboot' &", use_sudo=True)
+            self.logger.info("  Reboot command sent.")
 
-        # Close current connection (it will be dropped anyway)
-        try:
-            self.ssh.client.close()
-        except Exception:
-            pass
-        self.ssh.client = None
+            # Close current connection (it will be dropped anyway)
+            try:
+                self.ssh.client.close()
+            except Exception:
+                pass
+            self.ssh.client = None
 
-        # Step 2: Wait for SSH to come back
-        self.logger.info("  Waiting for device to reboot and SSH to become available...")
-        if not self._wait_for_ssh():
-            return False
+            # Step 2: Wait for SSH to come back
+            self.logger.info("  Waiting for device to reboot and SSH to become available...")
+            if not self._wait_for_ssh():
+                return False
 
-        # Step 3: Verify the machine is up
-        exit_code, uptime_out, _ = self.ssh.run_command("uptime")
-        self.logger.info(f"  Device is up: {uptime_out}")
+            # Step 3: Verify the machine is up
+            exit_code, uptime_out, _ = self.ssh.run_command("uptime")
+            self.logger.info(f"  Device is up: {uptime_out}")
 
-        # Step 4: Verify the correct kernel is running
-        exit_code, kernel_out, _ = self.ssh.run_command("uname -a")
-        self.logger.info(f"  Kernel check (uname -a): {kernel_out}")
+            # Step 4: Verify the correct kernel is running
+            exit_code, kernel_out, _ = self.ssh.run_command("uname -a")
+            self.logger.info(f"  Kernel check (uname -a): {kernel_out}")
 
-        if "6.5.0-45-generic" not in kernel_out:
-            self.logger.error(
-                f"  KERNEL VERIFICATION FAILED: Expected '6.5.0-45-generic' in uname output, "
-                f"got: {kernel_out}"
-            )
-            return False
-        self.logger.info("  Kernel 6.5.0-45-generic verified successfully.")
+            if "6.5.0-45-generic" not in kernel_out:
+                self.logger.error(
+                    f"  KERNEL VERIFICATION FAILED: Expected '6.5.0-45-generic' in uname output, "
+                    f"got: {kernel_out}"
+                )
+                return False
+            self.logger.info("  Kernel 6.5.0-45-generic verified successfully.")
 
         exit_code, kernel_out, _ = self.ssh.run_command("uname -r")
         self.logger.info(f"  Running kernel: {kernel_out}")
@@ -1110,10 +1293,8 @@ class InstallPackagesAndSDKs(SetupTask):
     Task: Install required system packages, Python packages, and cloud SDK repos.
 
     - Installs system packages (python3, pip, vsftpd, sysbench, etc.)
-    - Installs Python packages (ansible, pyroute2, crcmod)
+    - Installs Python packages (ansible, pyroute2)
     - Configures /etc/rc.local
-    - Adds Google Cloud SDK apt repository
-    - Adds Azure CLI apt repository
     """
 
     name = "Install Packages & Cloud SDKs"
@@ -1196,109 +1377,69 @@ class InstallPackagesAndSDKs(SetupTask):
 
 class InstallCloudCLIs(SetupTask):
     """
-    Task: Install cloud provider CLIs (Google Cloud, Azure).
+    Task: Remove cloud provider CLIs (Google Cloud, Azure).
 
-    Runs unconditionally after the Bryck build is deployed so the CLIs are
-    available to bryckutil KMS operations.  Each sub-step is non-fatal so a
-    single vendor failure does not abort the others.
+    Google Cloud CLI and Azure CLI are intentionally NOT installed. This task
+    ensures they are absent: if a previous run of this script installed them
+    (or added their apt repos / GPG keys), they are uninstalled and the repo
+    definitions are cleaned up. Each sub-step is non-fatal.
     """
 
-    name = "Install Cloud CLIs (Google / Azure)"
+    name = "Remove Cloud CLIs (Google / Azure)"
 
     def run(self) -> bool:
         self.logger.info(f"[TASK] {self.name}")
 
-        # Step 1: Add Google Cloud SDK repository
-        self.logger.info("  Adding Google Cloud SDK repository...")
-        exit_code, _, _ = self.ssh.run_command(
-            "test -f /usr/share/keyrings/cloud.google.gpg"
-        )
-        if exit_code != 0:
-            # Wrap entire pipe in bash -c so sudo applies to the whole pipeline
-            self.ssh.run_command(
-                "bash -c 'curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | "
-                "gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg'",
-                use_sudo=True,
-            )
-            self.ssh.run_command(
-                'bash -c \'echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] '
-                'https://packages.cloud.google.com/apt cloud-sdk main" > '
-                '/etc/apt/sources.list.d/google-cloud-sdk.list\'',
-                use_sudo=True,
-            )
-            self.logger.info("  Google Cloud SDK repo added.")
-        else:
-            self.logger.info("  Google Cloud SDK repo already configured. Skipping.")
-
-        # Install google-cloud-cli
-        self.logger.info("  Installing google-cloud-cli...")
+        # Step 1: Remove google-cloud-cli if present
+        self.logger.info("  Removing google-cloud-cli (if present)...")
         exit_code, _, _ = self.ssh.run_command("which gcloud")
         if exit_code == 0:
-            self.logger.info("  google-cloud-cli already installed. Skipping.")
-        else:
-            self.ssh.run_command("apt-get update", use_sudo=True)
             exit_code, _, err = self.ssh.run_command(
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y google-cloud-cli",
+                "DEBIAN_FRONTEND=noninteractive apt-get purge -y google-cloud-cli",
                 use_sudo=True,
             )
             if exit_code != 0:
-                self.logger.warning(f"  google-cloud-cli install failed: {err}")
+                self.logger.warning(f"  google-cloud-cli removal failed: {err}")
             else:
-                self.logger.info("  google-cloud-cli installed.")
-
-        # Step 2: Install crcmod (required by gsutil)
-        self.logger.info("  Installing crcmod...")
-        exit_code, _, err = self.ssh.run_command(
-            "pip3 install --no-cache-dir -U crcmod", use_sudo=True
-        )
-        if exit_code != 0:
-            self.logger.warning(f"  crcmod install failed: {err}")
+                self.logger.info("  google-cloud-cli removed.")
         else:
-            self.logger.info("  crcmod installed.")
+            self.logger.info("  google-cloud-cli not installed. Skipping.")
 
-        # Step 3: Add Azure CLI repository
-        self.logger.info("  Adding Azure CLI repository...")
-        exit_code, _, _ = self.ssh.run_command(
-            "test -f /usr/share/keyrings/microsoft.gpg"
+        # Remove the Google Cloud SDK apt repo + key added by earlier runs
+        self.ssh.run_command(
+            "rm -f /etc/apt/sources.list.d/google-cloud-sdk.list "
+            "/usr/share/keyrings/cloud.google.gpg",
+            use_sudo=True,
         )
-        if exit_code != 0:
-            self.ssh.run_command(
-                "bash -c 'curl -sL https://packages.microsoft.com/keys/microsoft.asc | "
-                "gpg --dearmor > /usr/share/keyrings/microsoft.gpg'",
-                use_sudo=True,
-            )
-            # Determine arch for the apt line
-            exit_code, arch, _ = self.ssh.run_command("dpkg --print-architecture")
-            arch = arch.strip()
-            exit_code, codename, _ = self.ssh.run_command("lsb_release -cs")
-            codename = codename.strip()
-            self.ssh.run_command(
-                f'bash -c \'echo "deb [arch={arch} signed-by=/usr/share/keyrings/microsoft.gpg] '
-                f'https://packages.microsoft.com/repos/azure-cli/ {codename} main" > '
-                f'/etc/apt/sources.list.d/azure-cli.list\'',
-                use_sudo=True,
-            )
-            self.logger.info(f"  Azure CLI repo added (arch={arch}, codename={codename}).")
-        else:
-            self.logger.info("  Azure CLI repo already configured. Skipping.")
 
-        # Install azure-cli
-        self.logger.info("  Installing azure-cli...")
+        # Step 2: Remove azure-cli if present
+        self.logger.info("  Removing azure-cli (if present)...")
         exit_code, _, _ = self.ssh.run_command("which az")
         if exit_code == 0:
-            self.logger.info("  azure-cli already installed. Skipping.")
-        else:
-            self.ssh.run_command("apt-get update", use_sudo=True)
             exit_code, _, err = self.ssh.run_command(
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y azure-cli",
+                "DEBIAN_FRONTEND=noninteractive apt-get purge -y azure-cli",
                 use_sudo=True,
             )
             if exit_code != 0:
-                self.logger.warning(f"  azure-cli install failed: {err}")
+                self.logger.warning(f"  azure-cli removal failed: {err}")
             else:
-                self.logger.info("  azure-cli installed.")
+                self.logger.info("  azure-cli removed.")
+        else:
+            self.logger.info("  azure-cli not installed. Skipping.")
 
-        self.logger.info("  Cloud CLIs configured successfully.")
+        # Remove the Azure CLI apt repo + key added by earlier runs
+        self.ssh.run_command(
+            "rm -f /etc/apt/sources.list.d/azure-cli.list "
+            "/usr/share/keyrings/microsoft.gpg",
+            use_sudo=True,
+        )
+
+        # Clean up orphaned dependencies left behind by the purges
+        self.ssh.run_command(
+            "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y", use_sudo=True
+        )
+
+        self.logger.info("  Cloud CLIs removed successfully.")
         return True
 
 
@@ -1482,16 +1623,27 @@ class ConfigureNetworkManagerAndSSL(SetupTask):
                 use_sudo=True,
             )
 
-            # Generate SSH key as bryck user (use -y to overwrite without prompting)
+            # Generate the key directly as root (we already have sudo) and then
+            # hand ownership to bryck. This avoids the fragile nested
+            # 'su - bryck -c "..."' quoting that mangled the empty-passphrase
+            # argument and made ssh-keygen fail with "Too many arguments".
             self.logger.info("  Generating RSA key for bryck...")
+            self.ssh.run_command(
+                "rm -f /home/bryck/.ssh/id_rsa /home/bryck/.ssh/id_rsa.pub",
+                use_sudo=True,
+            )
             exit_code, _, err = self.ssh.run_command(
-                'bash -c "rm -f /home/bryck/.ssh/id_rsa /home/bryck/.ssh/id_rsa.pub && '
-                'su - bryck -c \\"ssh-keygen -t rsa -N \\\\\\"\\\\\\"\\ -f /home/bryck/.ssh/id_rsa\\""',
+                "ssh-keygen -t rsa -b 4096 -N '' -f /home/bryck/.ssh/id_rsa",
                 use_sudo=True,
             )
             if exit_code != 0:
                 self.logger.error(f"  SSH keygen failed: {err}")
                 return False
+            # root created the files; give them back to bryck.
+            self.ssh.run_command(
+                "chown bryck:bryck /home/bryck/.ssh/id_rsa /home/bryck/.ssh/id_rsa.pub",
+                use_sudo=True,
+            )
             self.logger.info("  SSH key generated.")
 
         # Copy SSH key to localhost
@@ -1575,11 +1727,16 @@ class DeployBryckBuild(SetupTask):
         else:
             inventory_type = "bryck"
 
-        # Architecture suffix: bryckmini -> arm64, bryckserver -> amd64
-        if self.ssh.config.bryck_type == BryckType.BRYCKMINI:
-            tarball = f"{build_name}-arm64.tar.gz"
-        else:
-            tarball = f"{build_name}-amd64.tar.gz"
+        # Candidate tarball names. The build server may host the archive either
+        # WITH an architecture suffix (e.g. ...-arm64.tar.gz) or WITHOUT one
+        # (e.g. ....tar.gz). We check both — locally and on the build server —
+        # and use whichever actually exists.
+        arch_suffix = "arm64" if self.ssh.config.bryck_type == BryckType.BRYCKMINI else "amd64"
+        tarball_candidates = [
+            f"{build_name}-{arch_suffix}.tar.gz",
+            f"{build_name}.tar.gz",
+        ]
+        tarball = tarball_candidates[0]  # resolved for real in Step 2
         deploy_dir = f"/home/bryck/{build_name}"
 
         # Step 1: If already installed, uninstall first (enforce clean install)
@@ -1608,9 +1765,35 @@ class DeployBryckBuild(SetupTask):
                 self.logger.info("  bryckdeploy uninstall completed.")
 
         # Step 2: Download/transfer build tarball
-        self.logger.info(f"  Downloading {tarball}...")
-        exit_code, _, _ = self.ssh.run_command(f"test -f /home/bryck/{tarball}")
-        if exit_code == 0:
+        # Ensure the bryck home directory exists and is owned/writable by the
+        # bryck user. Without this, SCP into /home/bryck fails with
+        # "Permission denied" (the dir may be root-owned after provisioning).
+        self.logger.info("  Ensuring /home/bryck is writable by the bryck user...")
+        self.ssh.run_command("mkdir -p /home/bryck", use_sudo=True)
+        self.ssh.run_command("chown bryck:bryck /home/bryck", use_sudo=True)
+        self.ssh.run_command("chmod 755 /home/bryck", use_sudo=True)
+
+        # First see if any candidate is already present locally AND is a valid
+        # gzip archive. A bare `test -f` is not enough: a previous interrupted
+        # SCP can leave a truncated/corrupt file behind, which then fails tar
+        # with "unexpected end of file". `gzip -t` catches that so we re-download.
+        local_tarball = None
+        for candidate in tarball_candidates:
+            exit_code, _, _ = self.ssh.run_command(f"test -f /home/bryck/{candidate}")
+            if exit_code != 0:
+                continue
+            self.logger.info(f"  Found local /home/bryck/{candidate}; verifying integrity...")
+            gz_ok, _, _ = self.ssh.run_command(f"gzip -t /home/bryck/{candidate}", use_sudo=True)
+            if gz_ok == 0:
+                local_tarball = candidate
+                break
+            self.logger.warning(
+                f"  /home/bryck/{candidate} is corrupt/incomplete. Removing so it can be re-downloaded."
+            )
+            self.ssh.run_command(f"rm -f /home/bryck/{candidate}", use_sudo=True)
+
+        if local_tarball is not None:
+            tarball = local_tarball
             self.logger.info(f"  Tarball already exists at /home/bryck/{tarball}. Skipping download.")
         else:
             # Determine which build server to SCP from
@@ -1619,23 +1802,146 @@ class DeployBryckBuild(SetupTask):
             else:
                 build_server_ip = self.BUILD_SERVER_AMD64_IP
 
-            self.logger.info(
-                f"  SCP from {self.BUILD_SERVER_USER}@{build_server_ip}:/home/bryck/builds/{tarball}..."
-            )
-            scp_cmd = (
-                f"sshpass -p '{self.BUILD_SERVER_PASSWORD}' "
-                f"scp -o StrictHostKeyChecking=no "
-                f"{self.BUILD_SERVER_USER}@{build_server_ip}:/home/bryck/builds/{tarball} "
-                f"/home/bryck/{tarball}"
-            )
-            exit_code, _, err = self.ssh.run_command(scp_cmd, use_sudo=True, timeout=300)
+            # sshpass is required for both the remote probe and the SCP below,
+            # so make sure it is present before we use it.
+            exit_code, _, _ = self.ssh.run_command("which sshpass")
             if exit_code != 0:
-                self.logger.error(f"  SCP from build server failed: {err}")
-                return False
-            # Set ownership
-            self.ssh.run_command(f"chown bryck:bryck /home/bryck/{tarball}", use_sudo=True)
+                self.logger.info("  Installing sshpass (needed for build-server transfer)...")
+                self.ssh.run_command(
+                    "DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass", use_sudo=True
+                )
 
-        # Step 2b: Ensure sshpass is installed (needed for SCP operations)
+            # Probe the build server for whichever candidate actually exists.
+            ssh_opts = (
+                "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                "-o LogLevel=ERROR -o ConnectTimeout=15"
+            )
+            remote_tarball = None
+            for candidate in tarball_candidates:
+                self.logger.info(
+                    f"  Checking {self.BUILD_SERVER_USER}@{build_server_ip}:"
+                    f"/home/bryck/builds/{candidate} ..."
+                )
+                probe_cmd = (
+                    f"sshpass -p '{self.BUILD_SERVER_PASSWORD}' "
+                    f"ssh {ssh_opts} "
+                    f"{self.BUILD_SERVER_USER}@{build_server_ip} "
+                    f"test -f /home/bryck/builds/{candidate}"
+                )
+                exit_code, _, _ = self.ssh.run_command(probe_cmd, use_sudo=True, timeout=60)
+                if exit_code == 0:
+                    remote_tarball = candidate
+                    self.logger.info(f"  Found on build server: {candidate}")
+                    break
+                self.logger.info(f"  Not present: {candidate}")
+
+            if remote_tarball is None:
+                self.logger.error(
+                    f"  No build tarball found on {self.BUILD_SERVER_USER}@{build_server_ip}:"
+                    f"/home/bryck/builds/ (tried: {', '.join(tarball_candidates)})."
+                )
+                return False
+
+            tarball = remote_tarball
+            dest_path = f"/home/bryck/{tarball}"
+
+            # Determine the source size up front so we can show real progress
+            # and confirm the transfer actually completed.
+            size_cmd = (
+                f"sshpass -p '{self.BUILD_SERVER_PASSWORD}' "
+                f"ssh {ssh_opts} {self.BUILD_SERVER_USER}@{build_server_ip} "
+                f"stat -c %s /home/bryck/builds/{tarball}"
+            )
+            _, size_out, _ = self.ssh.run_command(size_cmd, use_sudo=True, timeout=60)
+            source_size = int(size_out.strip()) if size_out.strip().isdigit() else 0
+            if source_size:
+                self.logger.info(f"  Build size: {source_size / (1024*1024):.1f} MiB")
+
+            # Run the SCP in the BACKGROUND and monitor the destination file's
+            # size. scp is silent (no TTY) so a foreground call looks frozen and
+            # any fixed wall-clock cap risks killing a slow/large transfer. By
+            # watching byte growth we can wait as long as it keeps progressing
+            # and abort only on a genuine stall.
+            self.logger.info(
+                f"  Downloading from {self.BUILD_SERVER_USER}@{build_server_ip}:"
+                f"/home/bryck/builds/{tarball} (background + progress monitor)..."
+            )
+            rc_file = "/home/bryck/.scp_rc"
+            scp_log = "/home/bryck/.scp_log"
+            self.ssh.run_command(f"rm -f {rc_file} {scp_log}", use_sudo=True)
+
+            # Write a launcher script via SFTP to sidestep nested-quote issues.
+            try:
+                sftp = self.ssh.client.open_sftp()
+                with sftp.file("/tmp/run_scp.sh", "w") as f:
+                    f.write("#!/bin/bash\n")
+                    f.write(
+                        f"sshpass -p '{self.BUILD_SERVER_PASSWORD}' "
+                        f"scp {ssh_opts} "
+                        f"{self.BUILD_SERVER_USER}@{build_server_ip}:/home/bryck/builds/{tarball} "
+                        f"{dest_path} > {scp_log} 2>&1\n"
+                    )
+                    f.write(f"echo $? > {rc_file}\n")
+                sftp.close()
+            except Exception as e:
+                self.logger.error(f"  Failed to stage SCP launcher: {e}")
+                return False
+            self.ssh.run_command("mv /tmp/run_scp.sh /home/bryck/run_scp.sh", use_sudo=True)
+            self.ssh.run_command("chmod +x /home/bryck/run_scp.sh", use_sudo=True)
+            self.ssh.run_command("nohup bash /home/bryck/run_scp.sh >/dev/null 2>&1 &", use_sudo=True)
+
+            # Monitor progress: poll destination size until the rc file appears.
+            scp_rc = None
+            last_size = -1
+            last_change = time.monotonic()
+            while True:
+                _, rc_out, _ = self.ssh.run_command(f"cat {rc_file} 2>/dev/null || true")
+                if rc_out.strip().isdigit():
+                    scp_rc = int(rc_out.strip())
+                    break
+
+                _, sz_out, _ = self.ssh.run_command(f"stat -c %s {dest_path} 2>/dev/null || echo 0")
+                cur = int(sz_out.strip()) if sz_out.strip().isdigit() else 0
+                now = time.monotonic()
+                if cur != last_size:
+                    last_size = cur
+                    last_change = now
+                    if source_size:
+                        pct = min(100, cur * 100 // source_size)
+                        self.logger.info(
+                            f"  Downloading... {cur / (1024*1024):.1f}/"
+                            f"{source_size / (1024*1024):.1f} MiB ({pct}%)"
+                        )
+                    else:
+                        self.logger.info(f"  Downloading... {cur / (1024*1024):.1f} MiB")
+                elif now - last_change > self.ssh.config.idle_timeout:
+                    self.logger.error(
+                        f"  Download made no progress for {self.ssh.config.idle_timeout}s "
+                        f"(stuck at {cur} bytes). Aborting."
+                    )
+                    self.ssh.run_command(f"rm -f {dest_path}", use_sudo=True)
+                    return False
+                time.sleep(5)
+
+            if scp_rc != 0:
+                _, scp_err, _ = self.ssh.run_command(f"cat {scp_log} 2>/dev/null || true")
+                self.logger.error(f"  SCP from build server failed (rc={scp_rc}): {scp_err}")
+                self.ssh.run_command(f"rm -f {dest_path}", use_sudo=True)
+                return False
+
+            # Verify the transferred archive is intact before we rely on it.
+            gz_ok, _, gz_err = self.ssh.run_command(f"gzip -t {dest_path}", use_sudo=True)
+            if gz_ok != 0:
+                self.logger.error(
+                    f"  Transferred tarball {dest_path} is corrupt after SCP: {gz_err}"
+                )
+                self.ssh.run_command(f"rm -f {dest_path}", use_sudo=True)
+                return False
+            self.logger.info(f"  Download complete and verified: {dest_path}")
+            # Set ownership
+            self.ssh.run_command(f"chown bryck:bryck {dest_path}", use_sudo=True)
+
+        # Step 2b: Ensure sshpass is installed (needed for later SCP operations)
         exit_code, _, _ = self.ssh.run_command("which sshpass")
         if exit_code != 0:
             self.logger.info("  Installing sshpass...")
@@ -1681,7 +1987,22 @@ class DeployBryckBuild(SetupTask):
             if exit_code != 0:
                 self.logger.error(f"  Failed to extract tarball: {err}")
                 return False
-            self.ssh.run_command(f"chown -R bryck:bryck {deploy_dir}", use_sudo=True)
+
+        # Resolve the ACTUAL top-level directory the archive extracted to. It
+        # usually matches build_name, but a differently-named tarball may unpack
+        # into a different folder — in which case the hardcoded deploy_dir would
+        # be wrong and the later `cd {deploy_dir}` would fail.
+        exit_code, top_dir, _ = self.ssh.run_command(
+            f"tar -tzf /home/bryck/{tarball} 2>/dev/null | head -1 | cut -d/ -f1"
+        )
+        top_dir = top_dir.strip()
+        if top_dir and top_dir != build_name:
+            self.logger.info(
+                f"  Archive top-level dir '{top_dir}' differs from build name "
+                f"'{build_name}'; using /home/bryck/{top_dir}."
+            )
+            deploy_dir = f"/home/bryck/{top_dir}"
+        self.ssh.run_command(f"chown -R bryck:bryck {deploy_dir}", use_sudo=True)
 
         # Step 5b: Fix known package version conflicts before deploy
         # The ansible playbook pins jq=1.6-2.1ubuntu3 but libjq1 may have been
@@ -2161,9 +2482,12 @@ class ConfigureNetworkManagerInterfaces(SetupTask):
 
             # Rename live for current session
             self.logger.info(f"  Renaming {old_name} -> {new_name} live...")
+            # Wrap in bash -c so sudo applies to the WHOLE compound command;
+            # otherwise only the first 'ip link' runs as root and the rest run
+            # unprivileged.
             exit_code, _, err = self.ssh.run_command(
-                f"ip link set {old_name} down 2>/dev/null; "
-                f"ip link set {old_name} name {new_name} && ip link set {new_name} up",
+                f"bash -c 'ip link set {old_name} down 2>/dev/null; "
+                f"ip link set {old_name} name {new_name} && ip link set {new_name} up'",
                 use_sudo=True,
             )
             if exit_code != 0:
@@ -2183,8 +2507,8 @@ class ConfigureNetworkManagerInterfaces(SetupTask):
                 self.logger.warning(f"  Failed to write udev rules via SFTP: {e}")
                 return
             self.ssh.run_command(
-                "mv /tmp/70-bryck-net.rules /etc/udev/rules.d/70-bryck-net.rules "
-                "&& udevadm control --reload-rules && udevadm trigger",
+                "bash -c 'mv /tmp/70-bryck-net.rules /etc/udev/rules.d/70-bryck-net.rules "
+                "&& udevadm control --reload-rules && udevadm trigger'",
                 use_sudo=True,
             )
             self.logger.info("  Udev rules written: p0/p1 naming will persist on reboot.")
@@ -2214,7 +2538,7 @@ class ConfigureNetworkManagerInterfaces(SetupTask):
             return False
 
         self.ssh.run_command(
-            "mkdir -p /etc/NetworkManager/conf.d && mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf",
+            "bash -c 'mkdir -p /etc/NetworkManager/conf.d && mv /tmp/40-mlnx.conf /etc/NetworkManager/conf.d/40-mlnx.conf'",
             use_sudo=True,
         )
 
@@ -2829,8 +3153,8 @@ class ConfigureNVMeDrives(SetupTask):
 TASK_REGISTRY: list[type[SetupTask]] = [
     ConfigureDNS,
     CreateUsers,
-    ReconnectAsBryckUser,
-    ConfigureSudoers,
+    ConfigureSudoers,       # grant bryck NOPASSWD sudo while still privileged (ubuntu)
+    ReconnectAsBryckUser,   # only switch to bryck AFTER it has sudo
     ConfigureAPTSources,
     InstallKernel,
     SetHostname,
@@ -2841,8 +3165,8 @@ TASK_REGISTRY: list[type[SetupTask]] = [
     FlushIPTables,
     ConfigureNetworkManagerAndSSL,
     ConfigureNetworkManagerInterfaces,   # NM config — independent of build
+    InstallCloudCLIs,                    # removes Google/Azure CLIs before deploy
     DeployBryckBuild,
-    InstallCloudCLIs,                    # cloud CLIs — always runs, after build
     FixConfigJsonPermissions,
     ConfigureNFSExport,
     PostDeployVenvPackages,              # bryck venv + desktop — requires build
@@ -2950,6 +3274,17 @@ def run_all_tasks(config: DeviceConfig) -> bool:
                 logger.error(f"  Task '{task.name}' raised an exception: {e}")
                 success = False
             results[task.name] = success
+
+            # Abort early on foundational failures: without a bryck user that
+            # has working sudo, every remaining task would just fail with
+            # "bryck is not in the sudoers file". Continuing wastes time and
+            # buries the real error under dozens of cascading failures.
+            if task.critical and not success:
+                logger.error(
+                    f"  Critical task '{task.name}' failed. Aborting run — "
+                    "remaining tasks depend on it."
+                )
+                break
     finally:
         ssh.disconnect()
 
@@ -3005,6 +3340,12 @@ Examples:
         action="store_true",
         default=False,
         help="Print all commands that would be executed without connecting to the device.",
+    )
+    parser.add_argument(
+        "--skip-reboot",
+        action="store_true",
+        default=False,
+        help="Skip the reboot step (post-kernel packages are still installed on the running kernel).",
     )
     parser.add_argument(
         "--device-type",
@@ -3066,25 +3407,14 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [CHECK]  id bryck")
     print(f"  [SUDO]   useradd -m -s /bin/bash bryck")
     print(f"  [SUDO]   bash -c 'echo \"bryck:while(1);\" | chpasswd'")
+    print(f"  [SUDO]   usermod -aG sudo bryck")
     print(f"  [SUDO]   groupdel admin")
     print(f"  [CHECK]  id admin")
     print(f"  [SUDO]   useradd -m -s /bin/bash admin")
     print(f"  [SUDO]   bash -c 'echo \"admin:BryckAdm1n\" | chpasswd'")
     print()
 
-    # --- Task 3: Reconnect as bryck ---
-    task_num += 1
-    print(f"{'─'*70}")
-    print(f"  TASK {task_num}: Reconnect as bryck User")
-    print(f"{'─'*70}")
-    print(f"  [RUN]    whoami  (check current user)")
-    print(f"  [SKIP]   if already 'bryck', skips reconnect")
-    print(f"  [RUN]    id bryck  (verify user exists)")
-    print(f"  [ACTION] Close SSH session; reconnect as bryck / while(1);")
-    print(f"  [VERIFY] whoami  (confirm new session is bryck)")
-    print()
-
-    # --- Task 4: Configure Sudoers ---
+    # --- Task 3: Configure Sudoers (runs as bootstrap user, before switching to bryck) ---
     task_num += 1
     print(f"{'─'*70}")
     print(f"  TASK {task_num}: Configure Sudoers (/etc/sudoers)")
@@ -3094,6 +3424,18 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   bash -c 'echo -e \"<sudoers entries>\" >> /etc/sudoers'")
     print(f"           Appends: Cmnd_Alias MORE, Defaults!MORE, bryck/wsgi NOPASSWD, admin ALL")
     print(f"  [SUDO]   visudo -c")
+    print()
+
+    # --- Task 4: Reconnect as bryck ---
+    task_num += 1
+    print(f"{'─'*70}")
+    print(f"  TASK {task_num}: Reconnect as bryck User")
+    print(f"{'─'*70}")
+    print(f"  [RUN]    whoami  (check current user)")
+    print(f"  [SKIP]   if already 'bryck', skips reconnect")
+    print(f"  [RUN]    id bryck  (verify user exists)")
+    print(f"  [ACTION] Close SSH session; reconnect as bryck / while(1);")
+    print(f"  [VERIFY] whoami  (confirm new session is bryck)")
     print()
 
     # --- Task 5: Configure APT Sources ---
@@ -3224,7 +3566,8 @@ def dry_run_report(config: DeviceConfig) -> None:
     print(f"  [SUDO]   mv /tmp/10-globally-managed-devices.conf /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf")
     print(f"  [SUDO]   openssl req -x509 -newkey ec ... -out /etc/ssl/certs/bryckweb-selfsigned.crt")
     print(f"  [SUDO]   mkdir -p /home/bryck/.ssh && chown/chmod")
-    print(f"  [SUDO]   su - bryck -c 'ssh-keygen -t rsa -N \"\" -f /home/bryck/.ssh/id_rsa'")
+    print(f"  [SUDO]   ssh-keygen -t rsa -b 4096 -N '' -f /home/bryck/.ssh/id_rsa")
+    print(f"  [SUDO]   chown bryck:bryck /home/bryck/.ssh/id_rsa /home/bryck/.ssh/id_rsa.pub")
     print(f"  [SUDO]   su - bryck -c 'sshpass -p ... ssh-copy-id bryck@localhost'")
     print()
 
@@ -3369,6 +3712,17 @@ def dry_run_report(config: DeviceConfig) -> None:
 def main() -> None:
     args = parse_args()
 
+    # Force UTF-8 stdout/stderr so box-drawing characters in the dry-run
+    # report (and any unicode in logs) don't crash on Windows consoles that
+    # default to cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+
     # Handle dry-run mode
     if args.dry_run:
         if not args.device_type:
@@ -3382,6 +3736,7 @@ def main() -> None:
             bryck_type=BryckType(args.device_type),
             ssh_port=args.port,
             bryck_build=args.bryck_build,
+            skip_reboot=args.skip_reboot,
         )
         dry_run_report(config)
         sys.exit(0)
@@ -3393,6 +3748,7 @@ def main() -> None:
         bryck_type=None,  # Auto-detected after SSH connection
         ssh_port=args.port,
         bryck_build=args.bryck_build,
+        skip_reboot=args.skip_reboot,
     )
 
     success = run_all_tasks(config)
